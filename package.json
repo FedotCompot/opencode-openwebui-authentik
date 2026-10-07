@@ -1,0 +1,6 @@
+{
+  "name": "opencode-openwebui-authentik",
+  "private": true,
+  "type": "module",
+  "main": "index.js"
+}
