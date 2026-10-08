@@ -90,6 +90,10 @@ user > Credentials / Tokens, delete their `Provider for Open WebUI` entries in O
 Tokens and their `Provider for Open WebUI CLI` entries in OAuth Refresh Tokens. Revoking
 sessions is not enough. The outpost can take up to a minute to notice.
 
+## Tests
+
+`bun test` in this directory runs the plugin against mock authentik and Open WebUI servers.
+
 ## Known limitation
 
 If authentik rejects the token (after an admin revokes it, or when authentik is briefly
