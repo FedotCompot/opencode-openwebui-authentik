@@ -14,6 +14,9 @@ const JWT_ASSERTION = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 const REFRESH_GRACE_MS = 30_000
 const HTTP_TIMEOUT_MS = 30_000
 const SLOW_DOWN_MS = 5_000
+const REREAD_MS = 10_000
+const REREAD_INTERVAL_MS = 1_000
+const REJECTED_RETRY_MS = 2_000
 // core rejects an empty secret before hooks run
 const MINT_FAILED = "authentik-mint-failed"
 
@@ -23,9 +26,15 @@ export default {
     const config = settings(ctx.options)
     const shutdown = new AbortController()
     const relogin = `run: opencode auth login ${config.providerID} --method ${METHOD_ID}`
-    const authentik = createAuthentik(config, relogin, shutdown.signal)
-    const openwebui = createOpenWebUI(config, relogin, shutdown.signal)
-    const retryable = new Set()
+    const reread = async () => {
+      const connection = await ctx.integration.connection.active(config.providerID)
+      return connection && ctx.integration.connection.resolve(connection)
+    }
+    const authentik = createAuthentik(config, relogin, shutdown.signal, reread)
+    const openwebui = createOpenWebUI(config, shutdown.signal, authentik.rejection)
+    const pending = new Map()
+    const retried = new Set()
+    let flagged
 
     await ctx.integration.transform((editor) => {
       editor.method.remove(config.providerID, { type: "key" })
@@ -50,10 +59,19 @@ export default {
       return { connection, credential }
     }
 
+    const setStatus = (connection, status) =>
+      ctx.integration.connection.status({ integrationID: config.providerID, connection, status }).catch(() => {})
+
     const needsAuth = async (connection, message) => {
-      await ctx.integration.connection
-        .status({ integrationID: config.providerID, connection, status: { status: "needs_auth", message } })
-        .catch(() => {})
+      flagged = connection
+      await setStatus(connection, { status: "needs_auth", message })
+    }
+
+    const healthy = async () => {
+      if (!flagged) return
+      const connection = flagged
+      flagged = undefined
+      await setStatus(connection, undefined)
     }
 
     await ctx.session.hook(
@@ -64,7 +82,7 @@ export default {
           throw new Error(`Refusing to send authentik credentials to ${origin}; expected ${config.openwebuiOrigin}`)
         const { connection, credential } = await current()
         const token = await openwebui.token(credential.access).catch(async (error) => {
-          if (error instanceof AuthentikRejected) await needsAuth(connection, error.message)
+          if (error instanceof AuthentikRejected && error.revoked) await needsAuth(connection, error.message)
           throw error
         })
         event.request.headers.set("authorization", `Bearer ${credential.access}`)
@@ -77,18 +95,32 @@ export default {
       "http.response",
       async (event) => {
         const response = event.response
+        const session = event.sessionID
+        // title and generate requests never reach the retry hook
+        const tracked = event.kind === "primary" || event.kind === "compaction"
+        if (tracked) pending.delete(session)
         if (rejectedByAuthentik(response)) {
-          const message = rejection(response, relogin)
           await response.body?.cancel().catch(() => {})
-          await openwebui.forget(bearer(event.request))
-          const connection = await ctx.integration.connection.active(config.providerID).catch(() => undefined)
-          if (connection) await needsAuth(connection, message)
-          event.response = Response.json({ error: { type: "authentication_error", message } }, { status: 401 })
+          const proxyToken = bearer(event.request)
+          await openwebui.forget(proxyToken)
+          const error = await authentik.rejection(response, proxyToken)
+          if (error.revoked) {
+            const connection = await ctx.integration.connection.active(config.providerID).catch(() => undefined)
+            if (connection) await needsAuth(connection, error.message)
+          } else if (tracked) pending.set(session, REJECTED_RETRY_MS)
+          event.response = Response.json(
+            { error: { type: "authentication_error", message: error.message } },
+            { status: 401 },
+          )
           return
         }
-        if (response.status !== 401) return
-        await openwebui.forget(bearer(event.request), event.request.headers.get("x-open-webui-token"))
-        retryable.add(event.sessionID)
+        if (response.status === 401) {
+          await openwebui.forget(bearer(event.request), event.request.headers.get("x-open-webui-token"))
+          if (tracked) pending.set(session, 0)
+          return
+        }
+        if (tracked) retried.delete(session)
+        if (response.ok) await healthy()
       },
       { providerID: config.providerID },
     )
@@ -96,8 +128,11 @@ export default {
     await ctx.session.hook(
       "retry",
       (event) => {
-        if (!retryable.delete(event.sessionID)) return
-        if (event.error.status === 401 && event.attempt === 2) event.decision = { retry: true, delay: 0 }
+        const delay = pending.get(event.sessionID)
+        pending.delete(event.sessionID)
+        if (delay === undefined || event.error.status !== 401 || retried.has(event.sessionID)) return
+        retried.add(event.sessionID)
+        event.decision = { retry: true, delay }
       },
       { providerID: config.providerID },
     )
@@ -118,10 +153,11 @@ function settings(options) {
   }
 }
 
-function createAuthentik(config, relogin, shutdown) {
+function createAuthentik(config, relogin, shutdown, reread) {
   const endpoint = (path) => `${config.authentikURL}/application/o/${path}/`
   const flights = new Map()
   const mintErrors = new Map()
+  const rereading = new Set()
   let proxyClient = config.proxyClientID ? Promise.resolve(config.proxyClientID) : undefined
 
   const discover = async () => {
@@ -230,6 +266,10 @@ function createAuthentik(config, relogin, shutdown) {
       { grant_type: "refresh_token", client_id: config.cliClientID, refresh_token: stored.refresh },
       shutdown,
     )
+    if (response.body.error === "invalid_grant") {
+      const current = await rotatedElsewhere(stored.refresh)
+      if (current) return credential(current.refresh, current)
+    }
     if (!response.ok || typeof response.body.access_token !== "string")
       throw new Error(`authentik refused to refresh the login (${describe(response)}); ${relogin}`)
     const refresh = response.body.refresh_token || stored.refresh
@@ -240,6 +280,23 @@ function createAuthentik(config, relogin, shutdown) {
       mintErrors.set(refresh, error instanceof Error ? error.message : String(error))
       remember(refresh, Promise.resolve(failed))
       return failed
+    }
+  }
+
+  // another opencode process may have rotated it first
+  const rotatedElsewhere = async (spent) => {
+    rereading.add(spent)
+    try {
+      const deadline = Date.now() + REREAD_MS
+      while (true) {
+        const current = await reread().catch(() => undefined)
+        if (current?.type === "oauth" && current.methodID === METHOD_ID && current.refresh && current.refresh !== spent)
+          return current
+        if (Date.now() >= deadline) return undefined
+        await sleep(REREAD_INTERVAL_MS, shutdown)
+      }
+    } finally {
+      rereading.delete(spent)
     }
   }
 
@@ -264,6 +321,8 @@ function createAuthentik(config, relogin, shutdown) {
   }
 
   const refresh = (stored) => {
+    // core re-enters refresh while we re-read the spent token
+    if (rereading.has(stored.refresh)) return Promise.reject(new Error("The authentik refresh token was already used"))
     prune()
     const existing = flights.get(stored.refresh)
     if (existing) return existing.promise
@@ -277,10 +336,33 @@ function createAuthentik(config, relogin, shutdown) {
     }s, or ${relogin}`
   }
 
-  return { authorize, refresh, mintFailure }
+  const revoked = async (proxyToken) => {
+    const response = await fetch(endpoint("userinfo"), {
+      headers: { authorization: `Bearer ${proxyToken}`, accept: "application/json" },
+      redirect: "manual",
+      signal: timeout(shutdown),
+    }).catch(() => undefined)
+    await response?.body?.cancel().catch(() => {})
+    return response?.status === 401 && (response.headers.get("www-authenticate") ?? "").includes("invalid_token")
+  }
+
+  const rejection = async (response, proxyToken) => {
+    const seen = response.status >= 300 && response.status < 400 ? "a redirect" : "the sign-in page"
+    if (await revoked(proxyToken))
+      return new AuthentikRejected(
+        `authentik rejected the Open WebUI credential (got ${seen}, HTTP ${response.status}); ${relogin}`,
+        true,
+      )
+    return new AuthentikRejected(
+      `authentik could not verify the Open WebUI credential (got ${seen}, HTTP ${response.status}); try again shortly`,
+      false,
+    )
+  }
+
+  return { authorize, refresh, mintFailure, rejection }
 }
 
-function createOpenWebUI(config, relogin, shutdown) {
+function createOpenWebUI(config, shutdown, rejection) {
   const sessions = new Map()
 
   const signIn = async (proxyToken) => {
@@ -297,7 +379,7 @@ function createOpenWebUI(config, relogin, shutdown) {
     })
     if (rejectedByAuthentik(response)) {
       await response.body?.cancel().catch(() => {})
-      throw new AuthentikRejected(rejection(response, relogin))
+      throw await rejection(response, proxyToken)
     }
     const body = await response.json().catch(() => ({}))
     if (!response.ok || typeof body.token !== "string")
@@ -332,17 +414,17 @@ function createOpenWebUI(config, relogin, shutdown) {
   return { token, forget }
 }
 
-class AuthentikRejected extends Error {}
+class AuthentikRejected extends Error {
+  constructor(message, revoked) {
+    super(message)
+    this.revoked = revoked
+  }
+}
 
 function rejectedByAuthentik(response) {
   if (response.status >= 300 && response.status < 400) return true
   const html = (response.headers.get("content-type") ?? "").includes("text/html")
   return html && (response.status < 300 || response.status === 401 || response.status === 403)
-}
-
-function rejection(response, relogin) {
-  const seen = response.status >= 300 && response.status < 400 ? "a redirect" : "the sign-in page"
-  return `authentik rejected the Open WebUI credential (got ${seen}, HTTP ${response.status}); ${relogin}`
 }
 
 function bearer(request) {
