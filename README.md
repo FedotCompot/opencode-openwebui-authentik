@@ -13,8 +13,9 @@ Open WebUI API key.
   group. It then signs in to Open WebUI to get a session token for your email.
 - Each model request sends `Authorization: Bearer <authentik token>` and
   `X-Open-WebUI-Token: <Open WebUI token>`.
-- Tokens refresh automatically. If authentik rejects the login, the request fails with a
-  message that tells you to log in again.
+- Tokens refresh automatically. If authentik rejects a request, the plugin asks authentik
+  whether the token is still valid. Only a dead token marks the login as needing a new
+  sign-in; a passing glitch is retried once and clears itself.
 
 ## Install
 
@@ -67,17 +68,31 @@ valid until it expires or an admin revokes it in authentik.
 ## Errors
 
 - `No authentik login is active for openwebui`: run the login command.
-- `authentik rejected the Open WebUI credential`: the login was revoked or expired, or
-  you were removed from the `Open WebUI` group. Log in again.
+- `authentik rejected the Open WebUI credential`: an admin revoked your Open WebUI
+  token, or it expired. Log in again.
+- `authentik could not verify the Open WebUI credential`: authentik rejected the request
+  but still reports the token as valid, usually because authentik was briefly unreachable.
+  The plugin retries once; otherwise try again shortly.
 - `Could not find the Open WebUI authentik client`: `https://openwebui.example.com/`
   did not redirect to authentik. Check the URL, or set `proxyClientID`.
 - `Could not get an Open WebUI token from authentik`: the token exchange failed. Usually
   this means you aren't in the `Open WebUI` group, or your email is missing or
   duplicated. The plugin keeps your login and retries after 30 seconds.
 
+## Removing access
+
+authentik checks the `Open WebUI` group only when it issues an Open WebUI token. A user
+removed from the group keeps access until their current token expires (up to 12 hours),
+then gets the token exchange error above. To cut someone off immediately, deactivate them
+in authentik (Directory > Users > user > Deactivate), which deletes all their tokens. To
+keep the account active instead, remove them from the group and, under Directory > Users >
+user > Credentials / Tokens, delete their `Provider for Open WebUI` entries in OAuth Access
+Tokens and their `Provider for Open WebUI CLI` entries in OAuth Refresh Tokens. Revoking
+sessions is not enough. The outpost can take up to a minute to notice.
+
 ## Known limitation
 
-If authentik rejects the token (for example, after an admin revokes it), Traefik
-redirects the request to authentik. opencode follows the redirect and still sends the
+If authentik rejects the token (after an admin revokes it, or when authentik is briefly
+unreachable), Traefik redirects the request to authentik. opencode follows the redirect and still sends the
 `X-Open-WebUI-Token` header, so that request leaks the Open WebUI token to authentik.
 The plugin then drops that token and does not send it again.
