@@ -808,6 +808,51 @@ describe("model sync", () => {
     })
   })
 
+  test("turns each model's effort control into variants", async () => {
+    const control = (...options) => ({
+      label: "Control",
+      options: Object.fromEntries(options.map((option) => [option, { label: option }])),
+    })
+    const variant = (model, key, option) => ({
+      id: option,
+      body: { params: { model_controls: { [model]: { [key]: option } } } },
+    })
+    mocks.state.models = [
+      { id: "m", info: { params: { model_controls: { thinking: control("none", "high") } } } },
+      {
+        id: "pick",
+        name: "Pick",
+        info: { params: { model_controls: { verbosity: control("short"), thinking: control("low", "max") } } },
+      },
+      { id: "single", name: "Single", info: { params: { model_controls: { effort: control("low", "high") } } } },
+      { id: "ambiguous", name: "Ambiguous", info: { params: { model_controls: { a: control("x"), b: control("y") } } } },
+    ]
+    const fake = await setup({ modelsRefreshMinutes: 5 })
+    const { credential } = await login(fake)
+    fake.store(credential)
+    fake.emit({ type: "credential.switched" })
+    await until(() => fake.reloads.count === 1)
+    expect(models(fake)).toEqual({
+      m: {
+        id: "m",
+        name: "configured m",
+        limit: { context: 1000 },
+        variants: [variant("m", "thinking", "none"), variant("m", "thinking", "high")],
+      },
+      pick: { id: "pick", name: "Pick", variants: [variant("pick", "thinking", "low"), variant("pick", "thinking", "max")] },
+      single: {
+        id: "single",
+        name: "Single",
+        variants: [variant("single", "effort", "low"), variant("single", "effort", "high")],
+      },
+      ambiguous: { id: "ambiguous", name: "Ambiguous" },
+    })
+    mocks.state.models = [{ id: "m", info: { params: { model_controls: { thinking: control("none") } } } }]
+    fake.emit({ type: "credential.switched" })
+    await until(() => fake.reloads.count === 2)
+    expect(models(fake).m.variants).toEqual([variant("m", "thinking", "none")])
+  })
+
   test("re-syncs periodically, reloads only on change, stops on cleanup", async () => {
     const fake = await setup({ modelsRefreshMinutes: 1 })
     const { credential } = await login(fake)

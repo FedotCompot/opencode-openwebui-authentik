@@ -2,6 +2,7 @@ const MARKER = "openwebuiAuthentik"
 const SETTINGS = ["authentikURL", "cliClientID", "proxyClientID"]
 const DEFAULT_CLI_CLIENT_ID = "open-webui-cli"
 const MODELS_REFRESH_MINUTES = 5
+const EFFORT_CONTROL = "thinking"
 
 const METHOD_ID = "authentik"
 const AUTHORIZE_PATH = "/application/o/authorize/"
@@ -96,10 +97,11 @@ async function manage(ctx, settings, shutdown) {
       if (!models) return
       const configured = new Set(editor.list(config.providerID).map((model) => model.id))
       for (const id of configured) if (!models.has(id)) editor.remove(config.providerID, id)
-      for (const [id, name] of models) {
-        if (configured.has(id)) continue
+      for (const [id, served] of models) {
+        if (configured.has(id) && !served.variants.length) continue
         editor.update(config.providerID, id, (model) => {
-          model.name = name
+          if (!configured.has(id)) model.name = served.name
+          if (served.variants.length) model.variants = structuredClone(served.variants)
         })
       }
     }),
@@ -281,7 +283,20 @@ async function onEvents(ctx, handlers, signal) {
 }
 
 function sameModels(a, b) {
-  return a.size === b.size && [...a].every(([id, name]) => b.get(id) === name)
+  return JSON.stringify([...a]) === JSON.stringify([...b])
+}
+
+function effortVariants(model) {
+  const controls = model.info?.params?.model_controls
+  if (!isObject(controls)) return []
+  const keys = Object.keys(controls)
+  const key = keys.includes(EFFORT_CONTROL) ? EFFORT_CONTROL : keys.length === 1 ? keys[0] : undefined
+  const options = controls[key]?.options
+  if (!isObject(options)) return []
+  return Object.keys(options).map((option) => ({
+    id: option,
+    body: { params: { model_controls: { [model.id]: { [key]: option } } } },
+  }))
 }
 
 function createAuthentik(config, relogin, shutdown, reread) {
@@ -562,7 +577,13 @@ function createOpenWebUI(config, shutdown, rejection) {
     return new Map(
       body.data
         .filter((model) => typeof model?.id === "string" && model.id && !model.info?.meta?.hidden)
-        .map((model) => [model.id, typeof model.name === "string" && model.name ? model.name : model.id]),
+        .map((model) => [
+          model.id,
+          {
+            name: typeof model.name === "string" && model.name ? model.name : model.id,
+            variants: effortVariants(model),
+          },
+        ]),
     )
   }
 
