@@ -26,11 +26,15 @@ const CONFIGURED_MODELS = {
   openwebui: { m: { name: "configured m", limit: { context: 1000 } }, gone: { name: "gone" } },
 }
 
+const marked = (id = "openwebui", marker = true, baseURL = `${mocks.openwebui.url.origin}/api`) => ({
+  id,
+  settings: { baseURL, openwebuiAuthentik: marker },
+})
+
 // mirrors opencode core integration semantics
-function fakeCtx(options) {
-  const integrations = new Map([
-    ["openwebui", { methods: [{ type: "key", label: "Manually enter API Key" }], impl: new Map() }],
-  ])
+function fakeCtx(options, providerList = [marked()]) {
+  const integrations = new Map()
+  const integrationTransforms = []
   const credentials = []
   const hooks = { "http.request": [], "http.response": [], retry: [] }
   const statuses = []
@@ -52,18 +56,30 @@ function fakeCtx(options) {
       remove: (id, method) => {
         const entry = integrations.get(id)
         if (!entry) return
-        const index = entry.methods.findIndex((m) => m.type === method.type && (method.type !== "oauth" || m.id === method.id))
+        const index = entry.methods.findIndex(
+          (m) => m.type === method.type && (method.type !== "oauth" || m.id === method.id),
+        )
         if (index !== -1) entry.methods.splice(index, 1)
       },
     },
   }
+  const rebuildIntegrations = () => {
+    integrations.clear()
+    for (const { id } of providerList)
+      integrations.set(id, { methods: [{ type: "key", label: "Manually enter API Key" }], impl: new Map() })
+    for (const transform of integrationTransforms) transform(editor)
+  }
+  rebuildIntegrations()
   const modelTransforms = []
   const providers = new Map()
   const reloads = { count: 0 }
   const rebuild = () => {
     providers.clear()
     for (const [id, models] of Object.entries(CONFIGURED_MODELS))
-      providers.set(id, new Map(Object.entries(models).map(([model, info]) => [model, { id: model, ...structuredClone(info) }])))
+      providers.set(
+        id,
+        new Map(Object.entries(models).map(([model, info]) => [model, { id: model, ...structuredClone(info) }])),
+      )
     const modelEditor = {
       list: (id) => [...(providers.get(id)?.values() ?? [])],
       update: (id, model, fn) => {
@@ -101,16 +117,18 @@ function fakeCtx(options) {
   const ctx = {
     options,
     provider: {
-      list: async () => ({
-        location: { directory: "/" },
-        data: [{ id: "openwebui", settings: { baseURL: `${mocks.openwebui.url.origin}/api` } }, { id: "other", settings: {} }],
-      }),
+      list: async () => ({ location: { directory: "/" }, data: structuredClone(providerList) }),
     },
     model: {
       transform: async (callback) => {
         modelTransforms.push(callback)
         rebuild()
-        return { dispose: async () => {} }
+        return {
+          dispose: async () => {
+            modelTransforms.splice(modelTransforms.indexOf(callback), 1)
+            rebuild()
+          },
+        }
       },
       reload: async () => {
         reloads.count++
@@ -120,8 +138,14 @@ function fakeCtx(options) {
     event: { subscribe },
     integration: {
       transform: async (callback) => {
-        callback(editor)
-        return { dispose: async () => {} }
+        integrationTransforms.push(callback)
+        rebuildIntegrations()
+        return {
+          dispose: async () => {
+            integrationTransforms.splice(integrationTransforms.indexOf(callback), 1)
+            rebuildIntegrations()
+          },
+        }
       },
       connection: {
         active: async (id) => {
@@ -147,8 +171,9 @@ function fakeCtx(options) {
     },
     session: {
       hook: async (name, callback, opts) => {
-        hooks[name].push({ callback, opts })
-        return { dispose: async () => {} }
+        const hook = { callback, opts }
+        hooks[name].push(hook)
+        return { dispose: async () => hooks[name].splice(hooks[name].indexOf(hook), 1) }
       },
     },
   }
@@ -164,12 +189,16 @@ function fakeCtx(options) {
     }
     return event
   }
-  return { ctx, integrations, credentials, store, hooks, statuses, trigger, providers, reloads, emit }
+  const setProviders = (list) => {
+    providerList = list
+    rebuildIntegrations()
+    emit({ type: "provider.updated" })
+  }
+  return { ctx, integrations, credentials, store, hooks, statuses, trigger, providers, reloads, emit, setProviders }
 }
 
 const options = () => ({
   authentikURL: mocks.authentik.url.origin,
-  openwebuiURL: mocks.openwebui.url.origin,
   cliClientID: "cli-client",
   proxyClientID: "proxy-client",
   modelsRefreshMinutes: 0,
@@ -178,8 +207,8 @@ const options = () => ({
 const running = []
 afterEach(() => running.splice(0).forEach((fake) => fake.cleanup()))
 
-async function setup(overrides = {}) {
-  const fake = fakeCtx({ ...options(), ...overrides })
+async function setup(overrides = {}, providerList) {
+  const fake = fakeCtx({ ...options(), ...overrides }, providerList)
   fake.cleanup = await plugin.setup(fake.ctx)
   running.push(fake)
   return fake
@@ -197,6 +226,11 @@ const chatRequest = (fake, access) =>
     headers: { authorization: `Bearer ${access}`, "content-type": "application/json" },
     body: JSON.stringify({ model: "m", messages: [] }),
   })
+
+const until = async (check) => {
+  for (let i = 0; i < 400 && !check(); i++) await Bun.sleep(5)
+  expect(check()).toBe(true)
+}
 
 const scope = { sessionID: "ses_1", agent: "build", model: { providerID: "openwebui", id: "m" }, kind: "primary" }
 
@@ -232,21 +266,66 @@ describe("registration", () => {
 })
 
 describe("providers", () => {
-  test("manages every configured provider with its own settings", async () => {
-    const fake = await setup({ providers: { openwebui: {}, other: { cliClientID: "other-cli" } } })
-    for (const id of ["openwebui", "other"])
-      expect(fake.integrations.get(id).methods).toEqual([{ id: "authentik", type: "oauth", label: "authentik (device login)" }])
-    expect(fake.hooks["http.request"].map((h) => h.opts.providerID)).toEqual(["openwebui", "other"])
-    await expect(login(fake, "other")).rejects.toThrow(/device authorization failed.*invalid_client/)
-    await login(fake)
-    const other = { ...scope, model: { providerID: "other", id: "m" }, request: chatRequest(fake, "") }
-    await expect(fake.trigger("http.request", other)).rejects.toThrow(/run: opencode auth login other --method authentik/)
+  const hooked = (fake) => fake.hooks["http.request"].map((h) => h.opts.providerID)
+  const oauth = [{ id: "authentik", type: "oauth", label: "authentik (device login)" }]
+  const key = [{ type: "key", label: "Manually enter API Key" }]
+
+  test("manages only marked providers, with settings from their marker", async () => {
+    const fake = await setup({}, [
+      marked("openwebui-ks"),
+      marked("home-ai", { cliClientID: "other-cli" }),
+      { id: "dgx", settings: {} },
+    ])
+    expect(fake.integrations.get("openwebui-ks").methods).toEqual(oauth)
+    expect(fake.integrations.get("home-ai").methods).toEqual(oauth)
+    expect(fake.integrations.get("dgx").methods).toEqual(key)
+    expect(hooked(fake)).toEqual(["openwebui-ks", "home-ai"])
+    await expect(login(fake, "home-ai")).rejects.toThrow(/device authorization failed.*invalid_client/)
+    await login(fake, "openwebui-ks")
+    const home = { ...scope, model: { providerID: "home-ai", id: "m" }, request: chatRequest(fake, "") }
+    await expect(fake.trigger("http.request", home)).rejects.toThrow(
+      /run: opencode auth login home-ai --method authentik/,
+    )
+  })
+
+  test("adopts providers marked later and releases unmarked ones", async () => {
+    const fake = await setup({}, [])
+    expect(hooked(fake)).toEqual([])
+    fake.setProviders([marked(), marked("home-ai")])
+    await until(() => hooked(fake).length === 2)
+    expect(fake.integrations.get("home-ai").methods).toEqual(oauth)
+    fake.setProviders([
+      { id: "openwebui", settings: { baseURL: `${mocks.openwebui.url.origin}/api` } },
+      marked("home-ai"),
+    ])
+    await until(() => hooked(fake).length === 1)
+    expect(hooked(fake)).toEqual(["home-ai"])
+    expect(fake.integrations.get("openwebui").methods).toEqual(key)
+  })
+
+  test("a changed marker re-registers the provider, an unchanged one does not", async () => {
+    const fake = await setup()
+    const first = fake.hooks.retry[0]
+    fake.emit({ type: "provider.updated" })
+    await Bun.sleep(20)
+    expect(fake.hooks.retry).toEqual([first])
+    fake.setProviders([marked("openwebui", { cliClientID: "other-cli" })])
+    await until(() => fake.hooks.retry[0] !== first)
+    expect(hooked(fake)).toEqual(["openwebui"])
+    await expect(login(fake)).rejects.toThrow(/invalid_client/)
+  })
+
+  test("providers missing from the list stay managed", async () => {
+    const fake = await setup()
+    fake.setProviders([])
+    await Bun.sleep(20)
+    expect(hooked(fake)).toEqual(["openwebui"])
   })
 })
 
 describe("configuration", () => {
   test("without options, uses the provider's baseURL and discovers authentik from its redirect", async () => {
-    const fake = await setup({ authentikURL: undefined, openwebuiURL: undefined, proxyClientID: undefined })
+    const fake = await setup({ authentikURL: undefined, proxyClientID: undefined })
     const { credential } = await login(fake)
     expect(mocks.state.proxy.has(credential.access)).toBe(true)
     expect(mocks.state.counts.discover).toBe(1)
@@ -257,17 +336,15 @@ describe("configuration", () => {
     await expect(fake.trigger("http.request", { ...scope, request })).rejects.toThrow(/Refusing to send/)
   })
 
-  test("a provider without a baseURL or openwebuiURL fails with a hint", async () => {
-    const fake = await setup({ authentikURL: undefined, openwebuiURL: undefined, providers: { other: {} } })
-    await expect(login(fake, "other")).rejects.toThrow(/Set settings.baseURL on the other provider, or the openwebuiURL/)
+  test("a marked provider without a baseURL fails with a hint", async () => {
+    const fake = await setup({ authentikURL: undefined }, [marked("other", true, null)])
+    await expect(login(fake, "other")).rejects.toThrow(/Set settings.baseURL on the other provider/)
   })
 
-  test("provider entries override the shared settings", async () => {
-    const fake = await setup({ openwebuiURL: "https://shared.example", providers: { openwebui: { openwebuiURL: mocks.openwebui.url.origin } } })
+  test("marker settings override the plugin options", async () => {
+    const fake = await setup({ cliClientID: "wrong" }, [marked("openwebui", { cliClientID: "cli-client" })])
     const { credential } = await login(fake)
-    fake.store(credential)
-    const sent = await fake.trigger("http.request", { ...scope, request: chatRequest(fake, "") })
-    expect(sent.request.headers.get("authorization")).toBe(`Bearer ${credential.access}`)
+    expect(mocks.state.proxy.has(credential.access)).toBe(true)
   })
 })
 
@@ -366,7 +443,9 @@ describe("refresh", () => {
     expect(mocks.state.refresh.get(failed.refresh).revoked).toBe(false)
 
     const request = { ...scope, request: chatRequest(fake, "") }
-    await expect(fake.trigger("http.request", request)).rejects.toThrow(/Could not get an Open WebUI token.*invalid_grant/)
+    await expect(fake.trigger("http.request", request)).rejects.toThrow(
+      /Could not get an Open WebUI token.*invalid_grant/,
+    )
     expect(mocks.state.counts.refresh).toBe(1)
 
     mocks.state.mintFail = false
@@ -401,7 +480,10 @@ describe("refresh", () => {
     const { credential } = await login(fake)
     const saved = fake.store(credential)
     const other = await setup()
-    const rotated = await other.integrations.get("openwebui").impl.get("authentik").refresh({ ...credential, expires: 0 })
+    const rotated = await other.integrations
+      .get("openwebui")
+      .impl.get("authentik")
+      .refresh({ ...credential, expires: 0 })
     saved.value = rotated
     const mints = mocks.state.counts.mint
     const impl = fake.integrations.get("openwebui").impl.get("authentik")
@@ -443,7 +525,10 @@ describe("proxy client discovery", () => {
   })
 
   test("refuses a redirect to another origin or path", async () => {
-    for (const location of ["https://evil.example/application/o/authorize/?client_id=x", `${mocks.authentik.url.origin}/flow?client_id=x`]) {
+    for (const location of [
+      "https://evil.example/application/o/authorize/?client_id=x",
+      `${mocks.authentik.url.origin}/flow?client_id=x`,
+    ]) {
       mocks.state.discoverLocation = location
       const fake = await setup({ proxyClientID: undefined })
       await expect(login(fake)).rejects.toThrow(/Could not find the Open WebUI authentik client/)
@@ -641,7 +726,12 @@ describe("response hook", () => {
     const event = await respond(fake, upstream, sent.request)
     expect(event.response.status).toBe(401)
 
-    const retry = { ...scope, error: { type: "provider.auth", message: "Invalid token", status: 401 }, attempt: 2, decision: { retry: false } }
+    const retry = {
+      ...scope,
+      error: { type: "provider.auth", message: "Invalid token", status: 401 },
+      attempt: 2,
+      decision: { retry: false },
+    }
     await fake.trigger("retry", retry)
     expect(retry.decision).toEqual({ retry: true, delay: 0 })
     const again = { ...retry, attempt: 3, decision: { retry: false } }
@@ -694,10 +784,6 @@ describe("response hook", () => {
 })
 
 describe("model sync", () => {
-  const until = async (check) => {
-    for (let i = 0; i < 400 && !check(); i++) await Bun.sleep(5)
-    expect(check()).toBe(true)
-  }
   const models = (fake) => Object.fromEntries(fake.providers.get("openwebui"))
 
   test("syncs served models into the provider once a login exists", async () => {
@@ -740,18 +826,6 @@ describe("model sync", () => {
     const stopped = mocks.state.counts.models
     await Bun.sleep(200)
     expect(mocks.state.counts.models).toBe(stopped)
-  })
-
-  test("provider updates retry a provider that has not synced yet", async () => {
-    const fake = await setup({ modelsRefreshMinutes: 5 })
-    const { credential } = await login(fake)
-    fake.store(credential)
-    fake.emit({ type: "provider.updated" })
-    await until(() => fake.reloads.count === 1)
-    const fetched = mocks.state.counts.models
-    fake.emit({ type: "provider.updated" })
-    await Bun.sleep(50)
-    expect(mocks.state.counts.models).toBe(fetched)
   })
 
   test("a failed fetch keeps the last list and the next sync signs in again", async () => {

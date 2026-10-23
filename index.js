@@ -1,6 +1,6 @@
-const SETTINGS = ["openwebuiURL", "authentikURL", "cliClientID", "proxyClientID"]
+const MARKER = "openwebuiAuthentik"
+const SETTINGS = ["authentikURL", "cliClientID", "proxyClientID"]
 const DEFAULT_CLI_CLIENT_ID = "open-webui-cli"
-const DEFAULT_PROVIDERS = { openwebui: {} }
 const MODELS_REFRESH_MINUTES = 5
 
 const METHOD_ID = "authentik"
@@ -22,64 +22,88 @@ export default {
   id: "openwebui-authentik",
   setup: async (ctx) => {
     const shutdown = new AbortController()
-    const providers = await Promise.all(configure(ctx.options).map((config) => manage(ctx, config, shutdown.signal)))
+    const managed = new Map()
     const refreshMs = modelsRefreshMinutes(ctx.options) * 60_000
-    if (refreshMs > 0) {
-      const syncAll = () => providers.forEach((provider) => provider.sync())
-      syncAll()
-      every(refreshMs, syncAll, shutdown.signal).catch(() => {})
-      const syncPending = () => providers.filter((provider) => !provider.synced()).forEach((provider) => provider.sync())
-      onEvents(ctx, { credential: syncAll, provider: syncPending }, shutdown.signal).catch(() => {})
-    }
+    const syncAll = () => refreshMs > 0 && managed.forEach((provider) => provider.sync())
+    let adopting = Promise.resolve()
+    const reconcile = () =>
+      (adopting = adopting.then(() => adopt(ctx, managed, shutdown.signal, refreshMs > 0)).catch(() => {}))
+    await reconcile()
+    if (refreshMs > 0) every(refreshMs, syncAll, shutdown.signal).catch(() => {})
+    onEvents(ctx, { credential: syncAll, provider: reconcile }, shutdown.signal).catch(() => {})
     return () => shutdown.abort()
   },
 }
 
+// unlisted providers stay managed; the list is partial at startup
+async function adopt(ctx, managed, shutdown, sync) {
+  const { data = [] } = await ctx.provider.list()
+  for (const provider of data) {
+    const marked = Boolean(provider.settings?.[MARKER])
+    const config = marked ? configure(ctx.options, provider) : undefined
+    const current = managed.get(provider.id)
+    if (current?.key === config?.key) continue
+    if (current) {
+      managed.delete(provider.id)
+      await current.dispose()
+    }
+    if (!config) continue
+    const adopted = await manage(ctx, config, shutdown)
+    managed.set(provider.id, adopted)
+    if (sync) adopted.sync()
+  }
+}
+
 async function manage(ctx, settings, shutdown) {
-  let origin
+  const stop = new AbortController()
+  const signal = AbortSignal.any([shutdown, stop.signal])
   const config = {
     ...settings,
-    origin: () =>
-      (origin ??= openwebuiOrigin(ctx, settings).catch((error) => {
-        origin = undefined
-        throw error
-      })),
+    origin: async () => {
+      if (!settings.openwebuiOrigin) throw new Error(`Set settings.baseURL on the ${settings.providerID} provider`)
+      return settings.openwebuiOrigin
+    },
   }
+  const registrations = []
   const relogin = `run: opencode auth login ${config.providerID} --method ${METHOD_ID}`
   const reread = async () => {
     const connection = await ctx.integration.connection.active(config.providerID)
     return connection && ctx.integration.connection.resolve(connection)
   }
-  const authentik = createAuthentik(config, relogin, shutdown, reread)
-  const openwebui = createOpenWebUI(config, shutdown, authentik.rejection)
+  const authentik = createAuthentik(config, relogin, signal, reread)
+  const openwebui = createOpenWebUI(config, signal, authentik.rejection)
   const pending = new Map()
   const retried = new Set()
   let flagged
   let models
   let syncing = Promise.resolve()
 
-  await ctx.integration.transform((editor) => {
-    editor.method.remove(config.providerID, { type: "key" })
-    editor.method.update({
-      integrationID: config.providerID,
-      method: { id: METHOD_ID, type: "oauth", label: "authentik (device login)" },
-      authorize: () => authentik.authorize(),
-      refresh: (credential) => authentik.refresh(credential),
-      label: (credential) => account(credential.access),
-    })
-  })
-
-  await ctx.model.transform((editor) => {
-    if (!models) return
-    const configured = new Set(editor.list(config.providerID).map((model) => model.id))
-    for (const id of configured) if (!models.has(id)) editor.remove(config.providerID, id)
-    for (const [id, name] of models) {
-      if (configured.has(id)) continue
-      editor.update(config.providerID, id, (model) => {
-        model.name = name
+  registrations.push(
+    await ctx.integration.transform((editor) => {
+      editor.method.remove(config.providerID, { type: "key" })
+      editor.method.update({
+        integrationID: config.providerID,
+        method: { id: METHOD_ID, type: "oauth", label: "authentik (device login)" },
+        authorize: () => authentik.authorize(),
+        refresh: (credential) => authentik.refresh(credential),
+        label: (credential) => account(credential.access),
       })
-    }
-  })
+    }),
+  )
+
+  registrations.push(
+    await ctx.model.transform((editor) => {
+      if (!models) return
+      const configured = new Set(editor.list(config.providerID).map((model) => model.id))
+      for (const id of configured) if (!models.has(id)) editor.remove(config.providerID, id)
+      for (const [id, name] of models) {
+        if (configured.has(id)) continue
+        editor.update(config.providerID, id, (model) => {
+          model.name = name
+        })
+      }
+    }),
+  )
 
   const current = async () => {
     const connection = await ctx.integration.connection.active(config.providerID)
@@ -121,100 +145,114 @@ async function manage(ctx, settings, shutdown) {
     await ctx.model.reload()
   }
 
-  await ctx.session.hook(
-    "http.request",
-    async (event) => {
-      const origin = new URL(event.request.url).origin
-      const expected = await config.origin()
-      if (origin !== expected)
-        throw new Error(`Refusing to send authentik credentials to ${origin}; expected ${expected}`)
-      const { connection, credential } = await current()
-      const token = await openwebui.token(credential.access).catch(flagRevoked(connection))
-      event.request.headers.set("authorization", `Bearer ${credential.access}`)
-      event.request.headers.set("x-open-webui-token", token)
-    },
-    { providerID: config.providerID },
+  registrations.push(
+    await ctx.session.hook(
+      "http.request",
+      async (event) => {
+        const origin = new URL(event.request.url).origin
+        const expected = await config.origin()
+        if (origin !== expected)
+          throw new Error(`Refusing to send authentik credentials to ${origin}; expected ${expected}`)
+        const { connection, credential } = await current()
+        const token = await openwebui.token(credential.access).catch(flagRevoked(connection))
+        event.request.headers.set("authorization", `Bearer ${credential.access}`)
+        event.request.headers.set("x-open-webui-token", token)
+      },
+      { providerID: config.providerID },
+    ),
   )
 
-  await ctx.session.hook(
-    "http.response",
-    async (event) => {
-      const response = event.response
-      const session = event.sessionID
-      // title and generate requests never reach the retry hook
-      const tracked = event.kind === "primary" || event.kind === "compaction"
-      if (tracked) pending.delete(session)
-      if (rejectedByAuthentik(response)) {
-        await response.body?.cancel().catch(() => {})
-        const proxyToken = bearer(event.request)
-        await openwebui.forget(proxyToken)
-        const error = await authentik.rejection(response, proxyToken)
-        if (error.revoked) {
-          const connection = await ctx.integration.connection.active(config.providerID).catch(() => undefined)
-          if (connection) await needsAuth(connection, error.message)
-        } else if (tracked) pending.set(session, REJECTED_RETRY_MS)
-        event.response = Response.json(
-          { error: { type: "authentication_error", message: error.message } },
-          { status: 401 },
-        )
-        return
-      }
-      if (response.status === 401) {
-        await openwebui.forget(bearer(event.request), event.request.headers.get("x-open-webui-token"))
-        if (tracked) pending.set(session, 0)
-        return
-      }
-      if (tracked) retried.delete(session)
-      if (response.ok) await healthy()
-    },
-    { providerID: config.providerID },
+  registrations.push(
+    await ctx.session.hook(
+      "http.response",
+      async (event) => {
+        const response = event.response
+        const session = event.sessionID
+        // title and generate requests never reach the retry hook
+        const tracked = event.kind === "primary" || event.kind === "compaction"
+        if (tracked) pending.delete(session)
+        if (rejectedByAuthentik(response)) {
+          await response.body?.cancel().catch(() => {})
+          const proxyToken = bearer(event.request)
+          await openwebui.forget(proxyToken)
+          const error = await authentik.rejection(response, proxyToken)
+          if (error.revoked) {
+            const connection = await ctx.integration.connection.active(config.providerID).catch(() => undefined)
+            if (connection) await needsAuth(connection, error.message)
+          } else if (tracked) pending.set(session, REJECTED_RETRY_MS)
+          event.response = Response.json(
+            { error: { type: "authentication_error", message: error.message } },
+            { status: 401 },
+          )
+          return
+        }
+        if (response.status === 401) {
+          await openwebui.forget(bearer(event.request), event.request.headers.get("x-open-webui-token"))
+          if (tracked) pending.set(session, 0)
+          return
+        }
+        if (tracked) retried.delete(session)
+        if (response.ok) await healthy()
+      },
+      { providerID: config.providerID },
+    ),
   )
 
-  await ctx.session.hook(
-    "retry",
-    (event) => {
-      const delay = pending.get(event.sessionID)
-      pending.delete(event.sessionID)
-      if (delay === undefined || event.error.status !== 401 || retried.has(event.sessionID)) return
-      retried.add(event.sessionID)
-      event.decision = { retry: true, delay }
-    },
-    { providerID: config.providerID },
+  registrations.push(
+    await ctx.session.hook(
+      "retry",
+      (event) => {
+        const delay = pending.get(event.sessionID)
+        pending.delete(event.sessionID)
+        if (delay === undefined || event.error.status !== 401 || retried.has(event.sessionID)) return
+        retried.add(event.sessionID)
+        event.decision = { retry: true, delay }
+      },
+      { providerID: config.providerID },
+    ),
   )
 
   return {
+    key: config.key,
     sync: () => (syncing = syncing.then(() => fetchModels().catch(() => {}))),
-    synced: () => models !== undefined,
+    dispose: async () => {
+      stop.abort()
+      await Promise.all(registrations.map((registration) => registration.dispose()))
+      await ctx.model.reload().catch(() => {})
+    },
   }
 }
 
-function configure(options) {
-  const shared = strings(options)
-  const providers = isObject(options?.providers) ? options.providers : DEFAULT_PROVIDERS
-  return Object.entries(providers).map(([providerID, overrides]) => {
-    const merged = { authentikURL: "", cliClientID: DEFAULT_CLI_CLIENT_ID, proxyClientID: "", ...shared, ...strings(overrides) }
-    return {
-      ...merged,
-      providerID,
-      authentikURL: merged.authentikURL.replace(/\/+$/, ""),
-    }
-  })
+function configure(options, provider) {
+  const marker = provider.settings[MARKER]
+  const baseURL = provider.settings.baseURL
+  const merged = {
+    authentikURL: "",
+    cliClientID: DEFAULT_CLI_CLIENT_ID,
+    proxyClientID: "",
+    ...strings(options),
+    ...strings(isObject(marker) ? marker : {}),
+  }
+  return {
+    ...merged,
+    providerID: provider.id,
+    authentikURL: merged.authentikURL.replace(/\/+$/, ""),
+    openwebuiOrigin: originOf(baseURL),
+    key: JSON.stringify([marker, baseURL]),
+  }
 }
 
-async function openwebuiOrigin(ctx, config) {
-  if (config.openwebuiURL) return new URL(config.openwebuiURL).origin
-  const providers = await ctx.provider.list()
-  const baseURL = providers.data?.find((provider) => provider.id === config.providerID)?.settings?.baseURL
-  if (typeof baseURL !== "string" || !baseURL)
-    throw new Error(`Set settings.baseURL on the ${config.providerID} provider, or the openwebuiURL plugin option`)
-  return new URL(baseURL).origin
+function originOf(url) {
+  try {
+    return new URL(url).origin
+  } catch {
+    return undefined
+  }
 }
 
 function strings(options) {
   return Object.fromEntries(
-    SETTINGS
-      .filter((key) => typeof options?.[key] === "string" && options[key])
-      .map((key) => [key, options[key]]),
+    SETTINGS.filter((key) => typeof options?.[key] === "string" && options[key]).map((key) => [key, options[key]]),
   )
 }
 
@@ -234,7 +272,6 @@ async function every(ms, fn, signal) {
   }
 }
 
-// config providers load after plugins
 async function onEvents(ctx, handlers, signal) {
   for await (const event of ctx.event.subscribe({ signal })) {
     if (typeof event?.type !== "string") continue

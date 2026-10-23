@@ -5,7 +5,9 @@ use an [Open WebUI](https://openwebui.com) instance that sits behind
 [authentik](https://goauthentik.io) forward auth. You log in with your authentik account, so
 you don't need an Open WebUI API key.
 
-- It needs no settings of its own. Open WebUI is the provider's `settings.baseURL`, and the
+- A provider opts in with `"openwebuiAuthentik": true` in its `settings`, whatever its name.
+  You can mark several providers, one per Open WebUI instance.
+- It needs no other settings. Open WebUI is the provider's `settings.baseURL`, and the
   redirect that Open WebUI sends to logged-out clients gives both the authentik address
   and the client ID of the Open WebUI proxy provider. See [Options](#options) to pin them.
 - `opencode auth login` runs the authentik device-code login against a public OAuth2 client.
@@ -64,22 +66,26 @@ The plugin expects this on the authentik and Open WebUI side:
 ## Install
 
 1. Clone this repo somewhere stable.
-2. In `~/.config/opencode/opencode.jsonc`, add the directory to `plugins` and remove
-   `settings.apiKey` from the provider. The path must be the directory, not `index.js`;
+2. In `~/.config/opencode/opencode.jsonc`, add the directory to `plugins`, mark each Open
+   WebUI provider with `"openwebuiAuthentik": true` in its `settings`, and remove
+   `settings.apiKey` from it. The plugin path must be the directory, not `index.js`;
    opencode ignores file paths here.
 
    ```jsonc
    {
      "plugins": ["/home/<you>/code/opencode-openwebui-authentik"],
      "providers": {
-       "openwebui": {
+       "home-ai": {
          "package": "@opencode/ai/providers/openai-compatible",
-         "settings": { "baseURL": "https://openwebui.example.com/api" },
+         "settings": { "baseURL": "https://openwebui.example.com/api", "openwebuiAuthentik": true },
          "models": {}
        }
      }
    }
    ```
+
+   The marker stays inside opencode: it isn't sent with model requests. Providers without it
+   are left alone.
 
    Don't also copy the directory into `~/.config/opencode/plugins/`: that folder is loaded
    automatically, so opencode would find the plugin twice and report the second copy as a
@@ -88,44 +94,41 @@ The plugin expects this on the authentik and Open WebUI side:
 
 ## Options
 
-All options are optional. Use the plugin entry form
-`{ "package": "<dir>", "options": { ... } }`:
+All options are optional. Set them on the provider marker, as an object instead of `true`,
+for that provider only:
 
 ```jsonc
-{
-  "authentikURL": "https://authentik.example.com",
-  "modelsRefreshMinutes": 5,
-  "providers": {
-    "openwebui": {},
-    "openwebui-test": { "proxyClientID": "..." }
-  }
+"settings": {
+  "baseURL": "https://openwebui.example.com/api",
+  "openwebuiAuthentik": { "authentikURL": "https://authentik.example.com" }
 }
 ```
 
-- `providers`: the opencode providers the plugin manages, keyed by provider ID. Each one gets
-  its own authentik login (`opencode auth login <id> --method authentik`) and model sync.
-  Defaults to `{ "openwebui": {} }`.
-- `openwebuiURL`: the Open WebUI address, default the provider's `settings.baseURL`.
+or in the plugin entry `{ "package": "<dir>", "options": { ... } }` for every marked provider.
+A marker's settings win over the plugin options.
+
 - `authentikURL`: the authentik address. Discovered from Open WebUI's redirect when unset;
   when set, the plugin refuses a redirect anywhere else. Set it to keep a compromised Open
   WebUI host from sending you to a fake authentik login.
 - `proxyClientID`: the client ID of the Open WebUI proxy provider, discovered when unset.
   With both `authentikURL` and `proxyClientID` set, the plugin skips the discovery request.
 - `cliClientID`: the client ID of the CLI provider, default `open-webui-cli`.
-- These four can be set at the top level for all providers, or inside a provider entry for
-  that provider only.
-- `modelsRefreshMinutes`: how often to re-sync models, default `5`. `0` turns the sync off and
-  leaves the configured models alone.
+- `modelsRefreshMinutes` (plugin options only): how often to re-sync models, default `5`.
+  `0` turns the sync off and leaves the configured models alone.
+
+Changing a provider's marker or `baseURL` takes effect without a restart.
 
 ## Log in
 
 ```sh
-opencode auth login openwebui --method authentik
+opencode auth login home-ai --method authentik
 ```
+
+Use the provider ID of each marked provider.
 
 Open the URL it prints. authentik shows a consent screen; approve it only if you started this
 login yourself. The code is in the browser's address bar, not on the page. `opencode auth
-list` should then list your email under `openwebui`.
+list` should then list your email under the provider.
 
 Never approve a device login from a link someone sent you. That gives them your Open WebUI
 access.
@@ -133,7 +136,7 @@ access.
 ## Log out
 
 ```sh
-opencode auth logout openwebui
+opencode auth logout home-ai
 ```
 
 This deletes the stored credential on this machine. The authentik refresh token stays valid
@@ -141,9 +144,9 @@ until it expires or an admin revokes it in authentik.
 
 ## Errors
 
-- `Set settings.baseURL on the <id> provider, or the openwebuiURL plugin option`: the plugin
-  can't tell where Open WebUI is.
-- `No authentik login is active for openwebui`: run the login command.
+- `Set settings.baseURL on the <id> provider`: the provider is marked but has no valid
+  `baseURL`, so the plugin can't tell where Open WebUI is.
+- `No authentik login is active for <id>`: run the login command for that provider.
 - `authentik rejected the Open WebUI credential`: an admin revoked your Open WebUI token, or it
   expired. Log in again.
 - `authentik could not verify the Open WebUI credential`: authentik rejected the request but
