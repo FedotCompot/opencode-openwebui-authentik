@@ -65,15 +65,13 @@ The plugin expects this on the authentik and Open WebUI side:
 
 ## Install
 
-1. Clone this repo somewhere stable.
-2. In `~/.config/opencode/opencode.jsonc`, add the directory to `plugins`, mark each Open
-   WebUI provider with `"openwebuiAuthentik": true` in its `settings`, and remove
-   `settings.apiKey` from it. The plugin path must be the directory, not `index.js`;
-   opencode ignores file paths here.
+1. In `~/.config/opencode/opencode.jsonc`, add the npm package `opencode-openwebui-authentik`
+   to `plugins`, mark each Open WebUI provider with `"openwebuiAuthentik": true` in its
+   `settings`, and remove `settings.apiKey` from it.
 
    ```jsonc
    {
-     "plugins": ["/home/<you>/code/opencode-openwebui-authentik"],
+     "plugins": ["opencode-openwebui-authentik"],
      "providers": {
        "home-ai": {
          "package": "@opencode/ai/providers/openai-compatible",
@@ -87,10 +85,11 @@ The plugin expects this on the authentik and Open WebUI side:
    The marker stays inside opencode: it isn't sent with model requests. Providers without it
    are left alone.
 
-   Don't also copy the directory into `~/.config/opencode/plugins/`: that folder is loaded
-   automatically, so opencode would find the plugin twice and report the second copy as a
-   duplicate plugin ID.
-3. Check that it loaded: `opencode plugin list` should show `openwebui-authentik`.
+   To run from a clone instead, put the clone's directory in `plugins`. It must be the
+   directory, not `index.js`; opencode ignores file paths here. Don't also copy it into
+   `~/.config/opencode/plugins/`: that folder is loaded automatically, so opencode would
+   find the plugin twice and report the second copy as a duplicate plugin ID.
+2. Check that it loaded: `opencode plugin list` should show `openwebui-authentik`.
 
 ## Options
 
@@ -104,8 +103,8 @@ for that provider only:
 }
 ```
 
-or in the plugin entry `{ "package": "<dir>", "options": { ... } }` for every marked provider.
-A marker's settings win over the plugin options.
+or in the plugin entry `{ "package": "opencode-openwebui-authentik", "options": { ... } }`
+for every marked provider. A marker's settings win over the plugin options.
 
 - `authentikURL`: the authentik address. Discovered from Open WebUI's redirect when unset;
   when set, the plugin refuses a redirect anywhere else. Set it to keep a compromised Open
