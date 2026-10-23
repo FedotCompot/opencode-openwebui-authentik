@@ -5,6 +5,7 @@ const DEFAULTS = {
   proxyClientID: "",
 }
 const DEFAULT_PROVIDERS = { openwebui: {} }
+const MODELS_REFRESH_MINUTES = 5
 
 const METHOD_ID = "authentik"
 const CLI_SCOPE = "openid email profile offline_access"
@@ -24,7 +25,14 @@ export default {
   id: "openwebui-authentik",
   setup: async (ctx) => {
     const shutdown = new AbortController()
-    await Promise.all(configure(ctx.options).map((config) => manage(ctx, config, shutdown.signal)))
+    const providers = await Promise.all(configure(ctx.options).map((config) => manage(ctx, config, shutdown.signal)))
+    const refreshMs = modelsRefreshMinutes(ctx.options) * 60_000
+    if (refreshMs > 0) {
+      const syncAll = () => providers.forEach((provider) => provider.sync())
+      syncAll()
+      every(refreshMs, syncAll, shutdown.signal).catch(() => {})
+      onCredentialChange(ctx, syncAll, shutdown.signal).catch(() => {})
+    }
     return () => shutdown.abort()
   },
 }
@@ -40,6 +48,8 @@ async function manage(ctx, config, shutdown) {
   const pending = new Map()
   const retried = new Set()
   let flagged
+  let models
+  let syncing = Promise.resolve()
 
   await ctx.integration.transform((editor) => {
     editor.method.remove(config.providerID, { type: "key" })
@@ -50,6 +60,18 @@ async function manage(ctx, config, shutdown) {
       refresh: (credential) => authentik.refresh(credential),
       label: (credential) => account(credential.access),
     })
+  })
+
+  await ctx.model.transform((editor) => {
+    if (!models) return
+    const configured = new Set(editor.list(config.providerID).map((model) => model.id))
+    for (const id of configured) if (!models.has(id)) editor.remove(config.providerID, id)
+    for (const [id, name] of models) {
+      if (configured.has(id)) continue
+      editor.update(config.providerID, id, (model) => {
+        model.name = name
+      })
+    }
   })
 
   const current = async () => {
@@ -82,6 +104,14 @@ async function manage(ctx, config, shutdown) {
     const connection = flagged
     flagged = undefined
     await setStatus(connection, undefined)
+  }
+
+  const fetchModels = async () => {
+    const { connection, credential } = await current()
+    const served = await openwebui.models(credential.access).catch(flagRevoked(connection))
+    if (models && sameModels(models, served)) return
+    models = served
+    await ctx.model.reload()
   }
 
   await ctx.session.hook(
@@ -143,6 +173,8 @@ async function manage(ctx, config, shutdown) {
     },
     { providerID: config.providerID },
   )
+
+  return { sync: () => (syncing = syncing.then(() => fetchModels().catch(() => {}))) }
 }
 
 function configure(options) {
@@ -167,8 +199,30 @@ function strings(options) {
   )
 }
 
+function modelsRefreshMinutes(options) {
+  const minutes = options?.modelsRefreshMinutes
+  return Number.isFinite(minutes) && minutes >= 0 ? minutes : MODELS_REFRESH_MINUTES
+}
+
 function isObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+async function every(ms, fn, signal) {
+  while (true) {
+    await sleep(ms, signal)
+    fn()
+  }
+}
+
+async function onCredentialChange(ctx, fn, signal) {
+  for await (const event of ctx.event.subscribe({ signal })) {
+    if (typeof event?.type === "string" && event.type.startsWith("credential.")) fn()
+  }
+}
+
+function sameModels(a, b) {
+  return a.size === b.size && [...a].every(([id, name]) => b.get(id) === name)
 }
 
 function createAuthentik(config, relogin, shutdown, reread) {
@@ -421,6 +475,29 @@ function createOpenWebUI(config, shutdown, rejection) {
     }
   }
 
+  const models = async (proxyToken) => {
+    const session = await token(proxyToken)
+    const response = await fetch(`${config.openwebuiOrigin}/api/models`, {
+      headers: { authorization: `Bearer ${proxyToken}`, "x-open-webui-token": session, accept: "application/json" },
+      redirect: "manual",
+      signal: timeout(shutdown),
+    })
+    if (rejectedByAuthentik(response)) {
+      await response.body?.cancel().catch(() => {})
+      await forget(proxyToken)
+      throw await rejection(response, proxyToken)
+    }
+    if (response.status === 401) await forget(proxyToken, session)
+    const body = await response.json().catch(() => ({}))
+    if (!response.ok || !Array.isArray(body?.data))
+      throw new Error(`Open WebUI model list failed (HTTP ${response.status})`)
+    return new Map(
+      body.data
+        .filter((model) => typeof model?.id === "string" && model.id && !model.info?.meta?.hidden)
+        .map((model) => [model.id, typeof model.name === "string" && model.name ? model.name : model.id]),
+    )
+  }
+
   const forget = async (proxyToken, rejected) => {
     const cached = sessions.get(proxyToken)
     if (!cached) return
@@ -429,7 +506,7 @@ function createOpenWebUI(config, shutdown, rejection) {
     if (sessions.get(proxyToken) === cached) sessions.delete(proxyToken)
   }
 
-  return { token, forget }
+  return { token, models, forget }
 }
 
 class AuthentikRejected extends Error {

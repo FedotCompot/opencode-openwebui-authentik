@@ -16,7 +16,8 @@ export function createMocks() {
     offline: true,
     outpostDown: false,
     userinfoDown: false,
-    counts: { discover: 0, device: 0, poll: 0, refresh: 0, mint: 0, signin: 0, chat: 0, userinfo: 0 },
+    models: [{ id: "m", object: "model" }],
+    counts: { discover: 0, device: 0, poll: 0, refresh: 0, mint: 0, signin: 0, chat: 0, userinfo: 0, models: 0 },
     log: [],
     seq: 0,
   }
@@ -142,7 +143,11 @@ export function createMocks() {
         if (!token || !state.owuiTokens.has(token)) return json({ detail: "Invalid token" }, 401)
         return new Response(sse("pong from mock"), { headers: { "content-type": "text/event-stream" } })
       }
-      if (url.pathname === "/api/models") return json({ data: [{ id: "m", object: "model" }] })
+      if (url.pathname === "/api/models") {
+        state.counts.models++
+        if (!state.owuiTokens.has(req.headers.get("x-open-webui-token"))) return json({ detail: "Invalid token" }, 401)
+        return json({ data: state.models })
+      }
       return json({ detail: "not found" }, 404)
     },
   })

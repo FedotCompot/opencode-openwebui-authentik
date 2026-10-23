@@ -12,6 +12,10 @@ Open WebUI API key.
   group. It then signs in to Open WebUI to get a session token for your email.
 - Each model request sends `Authorization: Bearer <authentik token>` and
   `X-Open-WebUI-Token: <Open WebUI token>`.
+- The plugin keeps each managed provider's model list in sync with what Open WebUI serves
+  you: right after login and every 5 minutes. Models from `/api/models` that aren't in your
+  config are added; configured models that Open WebUI no longer serves are removed. Models
+  you configure keep your settings (name, limits), so list a model only to override them.
 - Tokens refresh automatically. If authentik rejects a request, the plugin asks authentik
   whether the token is still valid. Only a dead token marks the login as needing a new
   sign-in; a passing glitch is retried once and clears itself.
@@ -30,7 +34,7 @@ Open WebUI API key.
        "openwebui": {
          "package": "@opencode/ai/providers/openai-compatible",
          "settings": { "baseURL": "https://openwebui.example.com/api" },
-         "models": { "...": {} }
+         "models": {}
        }
      }
    }
@@ -52,6 +56,7 @@ Use the plugin entry form `{ "package": "<dir>", "options": { ... } }`:
     {
       "package": "/home/<you>/code/opencode-openwebui-authentik",
       "options": {
+        "modelsRefreshMinutes": 5,
         "providers": {
           "openwebui": {},
           "openwebui-test": { "openwebuiURL": "https://ai.test.example", "proxyClientID": "..." }
@@ -63,12 +68,14 @@ Use the plugin entry form `{ "package": "<dir>", "options": { ... } }`:
 ```
 
 - `providers`: the opencode providers the plugin manages, keyed by provider ID. Each one gets
-  its own authentik login (`opencode auth login <id> --method authentik`).
+  its own authentik login (`opencode auth login <id> --method authentik`) and model sync.
   Defaults to `{ "openwebui": {} }`.
 - `authentikURL`, `openwebuiURL`, `cliClientID`, `proxyClientID`: set them at the top level
   for all providers, or inside a provider entry for that provider only. They default to
   `https://authentik.example.com`, `https://openwebui.example.com`, `open-webui-cli`
   and discovery.
+- `modelsRefreshMinutes`: how often to re-sync models, default `5`. `0` turns the sync off and
+  leaves the configured models alone.
 
 ## Log in
 

@@ -22,6 +22,10 @@ afterAll(() => mocks.stop())
 
 const FIVE_MINUTES = 5 * 60 * 1000
 
+const CONFIGURED_MODELS = {
+  openwebui: { m: { name: "configured m", limit: { context: 1000 } }, gone: { name: "gone" } },
+}
+
 // mirrors opencode core integration semantics
 function fakeCtx(options) {
   const integrations = new Map([
@@ -53,8 +57,61 @@ function fakeCtx(options) {
       },
     },
   }
+  const modelTransforms = []
+  const providers = new Map()
+  const reloads = { count: 0 }
+  const rebuild = () => {
+    providers.clear()
+    for (const [id, models] of Object.entries(CONFIGURED_MODELS))
+      providers.set(id, new Map(Object.entries(models).map(([model, info]) => [model, { id: model, ...structuredClone(info) }])))
+    const modelEditor = {
+      list: (id) => [...(providers.get(id)?.values() ?? [])],
+      update: (id, model, fn) => {
+        const models = providers.get(id)
+        if (!models) return
+        const info = structuredClone(models.get(model) ?? { id: model, name: model })
+        fn(info)
+        models.set(model, info)
+      },
+      remove: (id, model) => providers.get(id)?.delete(model),
+    }
+    for (const transform of modelTransforms) transform(modelEditor)
+  }
+  const listeners = new Set()
+  const subscribe = ({ signal } = {}) =>
+    (async function* () {
+      const queue = []
+      let wake
+      const listener = (event) => {
+        queue.push(event)
+        wake?.()
+      }
+      listeners.add(listener)
+      signal?.addEventListener("abort", () => wake?.(), { once: true })
+      try {
+        while (!signal?.aborted) {
+          if (!queue.length) await new Promise((resolve) => (wake = resolve))
+          while (queue.length && !signal?.aborted) yield queue.shift()
+        }
+      } finally {
+        listeners.delete(listener)
+      }
+    })()
+  const emit = (event) => listeners.forEach((listener) => listener(event))
   const ctx = {
     options,
+    model: {
+      transform: async (callback) => {
+        modelTransforms.push(callback)
+        rebuild()
+        return { dispose: async () => {} }
+      },
+      reload: async () => {
+        reloads.count++
+        rebuild()
+      },
+    },
+    event: { subscribe },
     integration: {
       transform: async (callback) => {
         callback(editor)
@@ -101,7 +158,7 @@ function fakeCtx(options) {
     }
     return event
   }
-  return { ctx, integrations, credentials, store, hooks, statuses, trigger }
+  return { ctx, integrations, credentials, store, hooks, statuses, trigger, providers, reloads, emit }
 }
 
 const options = () => ({
@@ -109,6 +166,7 @@ const options = () => ({
   openwebuiURL: mocks.openwebui.url.origin,
   cliClientID: "cli-client",
   proxyClientID: "proxy-client",
+  modelsRefreshMinutes: 0,
 })
 
 const running = []
@@ -149,6 +207,7 @@ beforeEach(() => {
     outpostDown: false,
     userinfoDown: false,
     discoverLocation: undefined,
+    models: [{ id: "m", object: "model" }],
   })
   for (const key of Object.keys(mocks.state.counts)) mocks.state.counts[key] = 0
   mocks.state.log.length = 0
@@ -598,5 +657,93 @@ describe("response hook", () => {
     const retry = retryEvent()
     await fake.trigger("retry", retry)
     expect(retry.decision).toEqual({ retry: false })
+  })
+})
+
+describe("model sync", () => {
+  const until = async (check) => {
+    for (let i = 0; i < 400 && !check(); i++) await Bun.sleep(5)
+    expect(check()).toBe(true)
+  }
+  const models = (fake) => Object.fromEntries(fake.providers.get("openwebui"))
+
+  test("syncs served models into the provider once a login exists", async () => {
+    mocks.state.models = [
+      { id: "m", name: "Served m" },
+      { id: "new", name: "New model" },
+      { id: "bare" },
+      { id: "secret", info: { meta: { hidden: true } } },
+    ]
+    const fake = await setup({ modelsRefreshMinutes: 5 })
+    await Bun.sleep(20)
+    expect(fake.reloads.count).toBe(0)
+    expect(Object.keys(models(fake))).toEqual(["m", "gone"])
+    const { credential } = await login(fake)
+    fake.store(credential)
+    fake.emit({ type: "credential.switched", data: { integrationID: "openwebui" } })
+    await until(() => fake.reloads.count === 1)
+    expect(models(fake)).toEqual({
+      m: { id: "m", name: "configured m", limit: { context: 1000 } },
+      new: { id: "new", name: "New model" },
+      bare: { id: "bare", name: "bare" },
+    })
+  })
+
+  test("re-syncs periodically, reloads only on change, stops on cleanup", async () => {
+    const fake = await setup({ modelsRefreshMinutes: 1 })
+    const { credential } = await login(fake)
+    fake.store(credential)
+    fake.emit({ type: "credential.updated" })
+    await until(() => fake.reloads.count === 1)
+    const fetched = mocks.state.counts.models
+    await until(() => mocks.state.counts.models > fetched + 1)
+    expect(delays).toContain(60_000)
+    expect(fake.reloads.count).toBe(1)
+    mocks.state.models = [{ id: "later", name: "Later" }]
+    await until(() => fake.reloads.count === 2)
+    expect(Object.keys(models(fake))).toEqual(["later"])
+    fake.cleanup()
+    await Bun.sleep(20)
+    const stopped = mocks.state.counts.models
+    await Bun.sleep(200)
+    expect(mocks.state.counts.models).toBe(stopped)
+  })
+
+  test("a failed fetch keeps the last list and the next sync signs in again", async () => {
+    const fake = await setup({ modelsRefreshMinutes: 5 })
+    const { credential } = await login(fake)
+    fake.store(credential)
+    fake.emit({ type: "credential.switched" })
+    await until(() => fake.reloads.count === 1)
+    mocks.state.owuiTokens.clear()
+    fake.emit({ type: "credential.switched" })
+    await until(() => mocks.state.counts.models === 2)
+    await Bun.sleep(20)
+    expect(Object.keys(models(fake))).toEqual(["m"])
+    fake.emit({ type: "credential.switched" })
+    await until(() => mocks.state.counts.models === 3)
+    expect(mocks.state.counts.signin).toBe(2)
+    expect(fake.reloads.count).toBe(1)
+  })
+
+  test("a revoked login found by the background sync reports needs_auth", async () => {
+    const fake = await setup({ modelsRefreshMinutes: 5 })
+    const { credential } = await login(fake)
+    fake.store(credential)
+    mocks.state.proxy.delete(credential.access)
+    fake.emit({ type: "credential.switched" })
+    await until(() => fake.statuses.length === 1)
+    expect(fake.statuses[0]).toMatchObject({ integrationID: "openwebui", status: { status: "needs_auth" } })
+    expect(fake.reloads.count).toBe(0)
+  })
+
+  test("modelsRefreshMinutes 0 disables syncing", async () => {
+    const fake = await setup()
+    const { credential } = await login(fake)
+    fake.store(credential)
+    fake.emit({ type: "credential.switched" })
+    await Bun.sleep(50)
+    expect(mocks.state.counts.models).toBe(0)
+    expect(Object.keys(models(fake))).toEqual(["m", "gone"])
   })
 })
