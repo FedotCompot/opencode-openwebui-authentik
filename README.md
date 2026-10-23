@@ -20,6 +20,13 @@ you don't need an Open WebUI API key.
   you: right after login and every 5 minutes. Models from `/api/models` that aren't in your
   config are added; configured models that Open WebUI no longer serves are removed. Models
   you configure keep your settings (name, limits), so list a model only to override them.
+- A model's effort levels (opencode variants) come from its Open WebUI model control: the
+  one keyed `thinking`, or the model's only control. Each option becomes a variant, such as
+  `opencode run -m home-ai/deepseek-v4.1-flash#max`, and Open WebUI applies the params the
+  admin set for it. These variants replace any variants from your config or opencode's
+  catalog. Models without a control keep their own variants. Non-admin users need the
+  `chat.controls` and `chat.params` permissions; otherwise Open WebUI ignores the choice and
+  uses the default.
 - Tokens refresh automatically. If authentik rejects a request, the plugin asks authentik
   whether the token is still valid. Only a dead token marks the login as needing a new
   sign-in; a passing glitch is retried once and clears itself.
