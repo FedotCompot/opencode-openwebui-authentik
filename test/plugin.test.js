@@ -238,6 +238,23 @@ describe("providers", () => {
   })
 })
 
+describe("configuration", () => {
+  test("refuses a provider without its authentik and Open WebUI settings", async () => {
+    const fake = fakeCtx({ providers: { openwebui: {}, other: { authentikURL: mocks.authentik.url.origin } } })
+    await expect(plugin.setup(fake.ctx)).rejects.toThrow(
+      /provider openwebui needs authentikURL, openwebuiURL, cliClientID/,
+    )
+  })
+
+  test("provider entries override the shared settings", async () => {
+    const fake = await setup({ openwebuiURL: "https://shared.example", providers: { openwebui: { openwebuiURL: mocks.openwebui.url.origin } } })
+    const { credential } = await login(fake)
+    fake.store(credential)
+    const sent = await fake.trigger("http.request", { ...scope, request: chatRequest(fake, "") })
+    expect(sent.request.headers.get("authorization")).toBe(`Bearer ${credential.access}`)
+  })
+})
+
 describe("device login", () => {
   test("happy path: verification_uri_complete, polls, mints proxy token", async () => {
     const fake = await setup()
