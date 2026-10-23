@@ -100,6 +100,12 @@ function fakeCtx(options) {
   const emit = (event) => listeners.forEach((listener) => listener(event))
   const ctx = {
     options,
+    provider: {
+      list: async () => ({
+        location: { directory: "/" },
+        data: [{ id: "openwebui", settings: { baseURL: `${mocks.openwebui.url.origin}/api` } }, { id: "other", settings: {} }],
+      }),
+    },
     model: {
       transform: async (callback) => {
         modelTransforms.push(callback)
@@ -239,11 +245,21 @@ describe("providers", () => {
 })
 
 describe("configuration", () => {
-  test("refuses a provider without its authentik and Open WebUI settings", async () => {
-    const fake = fakeCtx({ providers: { openwebui: {}, other: { authentikURL: mocks.authentik.url.origin } } })
-    await expect(plugin.setup(fake.ctx)).rejects.toThrow(
-      /provider openwebui needs authentikURL, openwebuiURL$/,
-    )
+  test("without options, uses the provider's baseURL and discovers authentik from its redirect", async () => {
+    const fake = await setup({ authentikURL: undefined, openwebuiURL: undefined, proxyClientID: undefined })
+    const { credential } = await login(fake)
+    expect(mocks.state.proxy.has(credential.access)).toBe(true)
+    expect(mocks.state.counts.discover).toBe(1)
+    fake.store(credential)
+    const sent = await fake.trigger("http.request", { ...scope, request: chatRequest(fake, "") })
+    expect(mocks.state.owuiTokens.has(sent.request.headers.get("x-open-webui-token"))).toBe(true)
+    const request = new Request("https://evil.example/api/chat/completions", { method: "POST", body: "{}" })
+    await expect(fake.trigger("http.request", { ...scope, request })).rejects.toThrow(/Refusing to send/)
+  })
+
+  test("a provider without a baseURL or openwebuiURL fails with a hint", async () => {
+    const fake = await setup({ authentikURL: undefined, openwebuiURL: undefined, providers: { other: {} } })
+    await expect(login(fake, "other")).rejects.toThrow(/Set settings.baseURL on the other provider, or the openwebuiURL/)
   })
 
   test("provider entries override the shared settings", async () => {
@@ -724,6 +740,18 @@ describe("model sync", () => {
     const stopped = mocks.state.counts.models
     await Bun.sleep(200)
     expect(mocks.state.counts.models).toBe(stopped)
+  })
+
+  test("provider updates retry a provider that has not synced yet", async () => {
+    const fake = await setup({ modelsRefreshMinutes: 5 })
+    const { credential } = await login(fake)
+    fake.store(credential)
+    fake.emit({ type: "provider.updated" })
+    await until(() => fake.reloads.count === 1)
+    const fetched = mocks.state.counts.models
+    fake.emit({ type: "provider.updated" })
+    await Bun.sleep(50)
+    expect(mocks.state.counts.models).toBe(fetched)
   })
 
   test("a failed fetch keeps the last list and the next sync signs in again", async () => {

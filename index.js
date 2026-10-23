@@ -1,10 +1,10 @@
-const REQUIRED = ["authentikURL", "openwebuiURL"]
-const SETTINGS = [...REQUIRED, "cliClientID", "proxyClientID"]
+const SETTINGS = ["openwebuiURL", "authentikURL", "cliClientID", "proxyClientID"]
 const DEFAULT_CLI_CLIENT_ID = "open-webui-cli"
 const DEFAULT_PROVIDERS = { openwebui: {} }
 const MODELS_REFRESH_MINUTES = 5
 
 const METHOD_ID = "authentik"
+const AUTHORIZE_PATH = "/application/o/authorize/"
 const CLI_SCOPE = "openid email profile offline_access"
 const PROXY_SCOPE = "openid email profile ak_proxy"
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
@@ -28,13 +28,23 @@ export default {
       const syncAll = () => providers.forEach((provider) => provider.sync())
       syncAll()
       every(refreshMs, syncAll, shutdown.signal).catch(() => {})
-      onCredentialChange(ctx, syncAll, shutdown.signal).catch(() => {})
+      const syncPending = () => providers.filter((provider) => !provider.synced()).forEach((provider) => provider.sync())
+      onEvents(ctx, { credential: syncAll, provider: syncPending }, shutdown.signal).catch(() => {})
     }
     return () => shutdown.abort()
   },
 }
 
-async function manage(ctx, config, shutdown) {
+async function manage(ctx, settings, shutdown) {
+  let origin
+  const config = {
+    ...settings,
+    origin: () =>
+      (origin ??= openwebuiOrigin(ctx, settings).catch((error) => {
+        origin = undefined
+        throw error
+      })),
+  }
   const relogin = `run: opencode auth login ${config.providerID} --method ${METHOD_ID}`
   const reread = async () => {
     const connection = await ctx.integration.connection.active(config.providerID)
@@ -115,8 +125,9 @@ async function manage(ctx, config, shutdown) {
     "http.request",
     async (event) => {
       const origin = new URL(event.request.url).origin
-      if (origin !== config.openwebuiOrigin)
-        throw new Error(`Refusing to send authentik credentials to ${origin}; expected ${config.openwebuiOrigin}`)
+      const expected = await config.origin()
+      if (origin !== expected)
+        throw new Error(`Refusing to send authentik credentials to ${origin}; expected ${expected}`)
       const { connection, credential } = await current()
       const token = await openwebui.token(credential.access).catch(flagRevoked(connection))
       event.request.headers.set("authorization", `Bearer ${credential.access}`)
@@ -171,23 +182,32 @@ async function manage(ctx, config, shutdown) {
     { providerID: config.providerID },
   )
 
-  return { sync: () => (syncing = syncing.then(() => fetchModels().catch(() => {}))) }
+  return {
+    sync: () => (syncing = syncing.then(() => fetchModels().catch(() => {}))),
+    synced: () => models !== undefined,
+  }
 }
 
 function configure(options) {
   const shared = strings(options)
   const providers = isObject(options?.providers) ? options.providers : DEFAULT_PROVIDERS
   return Object.entries(providers).map(([providerID, overrides]) => {
-    const merged = { cliClientID: DEFAULT_CLI_CLIENT_ID, proxyClientID: "", ...shared, ...strings(overrides) }
-    const missing = REQUIRED.filter((key) => !merged[key])
-    if (missing.length) throw new Error(`openwebui-authentik: provider ${providerID} needs ${missing.join(", ")}`)
+    const merged = { authentikURL: "", cliClientID: DEFAULT_CLI_CLIENT_ID, proxyClientID: "", ...shared, ...strings(overrides) }
     return {
       ...merged,
       providerID,
       authentikURL: merged.authentikURL.replace(/\/+$/, ""),
-      openwebuiOrigin: new URL(merged.openwebuiURL).origin,
     }
   })
+}
+
+async function openwebuiOrigin(ctx, config) {
+  if (config.openwebuiURL) return new URL(config.openwebuiURL).origin
+  const providers = await ctx.provider.list()
+  const baseURL = providers.data?.find((provider) => provider.id === config.providerID)?.settings?.baseURL
+  if (typeof baseURL !== "string" || !baseURL)
+    throw new Error(`Set settings.baseURL on the ${config.providerID} provider, or the openwebuiURL plugin option`)
+  return new URL(baseURL).origin
 }
 
 function strings(options) {
@@ -214,9 +234,12 @@ async function every(ms, fn, signal) {
   }
 }
 
-async function onCredentialChange(ctx, fn, signal) {
+// config providers load after plugins
+async function onEvents(ctx, handlers, signal) {
   for await (const event of ctx.event.subscribe({ signal })) {
-    if (typeof event?.type === "string" && event.type.startsWith("credential.")) fn()
+    if (typeof event?.type !== "string") continue
+    if (event.type.startsWith("credential.")) handlers.credential()
+    else if (event.type === "provider.updated") handlers.provider()
   }
 }
 
@@ -225,34 +248,39 @@ function sameModels(a, b) {
 }
 
 function createAuthentik(config, relogin, shutdown, reread) {
-  const endpoint = (path) => `${config.authentikURL}/application/o/${path}/`
   const flights = new Map()
   const mintErrors = new Map()
   const rereading = new Set()
-  let proxyClient = config.proxyClientID ? Promise.resolve(config.proxyClientID) : undefined
+  let site =
+    config.authentikURL && config.proxyClientID
+      ? Promise.resolve({ authentikURL: config.authentikURL, proxyClientID: config.proxyClientID })
+      : undefined
 
   const discover = async () => {
-    const response = await fetch(`${config.openwebuiOrigin}/`, { redirect: "manual", signal: timeout(shutdown) })
+    const origin = await config.origin()
+    const response = await fetch(`${origin}/`, { redirect: "manual", signal: timeout(shutdown) })
     await response.body?.cancel().catch(() => {})
     const location = response.headers.get("location")
-    const target = location ? new URL(location, config.openwebuiOrigin) : undefined
-    const authorize = new URL(endpoint("authorize"))
-    const clientID =
-      target?.origin === authorize.origin && target.pathname === authorize.pathname
-        ? target.searchParams.get("client_id")
-        : null
-    if (!clientID)
-      throw new Error(`Could not find the Open WebUI authentik client at ${config.openwebuiOrigin} (HTTP ${response.status})`)
-    return clientID
+    const target = location ? new URL(location, origin) : undefined
+    const authentikURL = target?.pathname.endsWith(AUTHORIZE_PATH)
+      ? `${target.origin}${target.pathname.slice(0, -AUTHORIZE_PATH.length)}`
+      : undefined
+    const clientID = target?.searchParams.get("client_id")
+    const downgraded = target?.protocol !== "https:" && origin.startsWith("https:")
+    if (!authentikURL || !clientID || downgraded || (config.authentikURL && authentikURL !== config.authentikURL))
+      throw new Error(`Could not find the Open WebUI authentik client at ${origin} (HTTP ${response.status})`)
+    return { authentikURL: config.authentikURL || authentikURL, proxyClientID: config.proxyClientID || clientID }
   }
 
-  const proxyClientID = () => {
-    proxyClient ??= discover().catch((error) => {
-      proxyClient = undefined
+  const discovered = () => {
+    site ??= discover().catch((error) => {
+      site = undefined
       throw error
     })
-    return proxyClient
+    return site
   }
+
+  const endpoint = async (path) => `${(await discovered()).authentikURL}/application/o/${path}/`
 
   const credential = (refresh, minted) => ({
     type: "oauth",
@@ -264,10 +292,10 @@ function createAuthentik(config, relogin, shutdown, reread) {
 
   const mint = async (cliAccess) => {
     const response = await postForm(
-      endpoint("token"),
+      await endpoint("token"),
       {
         grant_type: "client_credentials",
-        client_id: await proxyClientID(),
+        client_id: (await discovered()).proxyClientID,
         client_assertion_type: JWT_ASSERTION,
         client_assertion: cliAccess,
         scope: PROXY_SCOPE,
@@ -275,7 +303,7 @@ function createAuthentik(config, relogin, shutdown, reread) {
       shutdown,
     )
     if (!response.ok || typeof response.body.access_token !== "string") {
-      if (response.body.error === "invalid_client" && !config.proxyClientID) proxyClient = undefined
+      if (response.body.error === "invalid_client" && !config.proxyClientID) site = undefined
       throw new Error(`authentik refused to mint an Open WebUI token (${describe(response)})`)
     }
     return { access: response.body.access_token, expires: expiry(response.body) }
@@ -287,7 +315,7 @@ function createAuthentik(config, relogin, shutdown, reread) {
       await sleep(interval, shutdown)
       if (Date.now() >= deadline) throw new Error(`The authentik device code expired before approval; ${relogin}`)
       const response = await postForm(
-        endpoint("token"),
+        await endpoint("token"),
         { grant_type: DEVICE_GRANT, client_id: config.cliClientID, device_code: device.device_code },
         shutdown,
       )
@@ -306,7 +334,7 @@ function createAuthentik(config, relogin, shutdown, reread) {
 
   const authorize = async () => {
     const response = await postForm(
-      endpoint("device"),
+      await endpoint("device"),
       { client_id: config.cliClientID, scope: CLI_SCOPE },
       shutdown,
     )
@@ -333,7 +361,7 @@ function createAuthentik(config, relogin, shutdown, reread) {
   const rotate = async (stored) => {
     if (!stored.refresh) throw new Error(`The authentik login has no refresh token; ${relogin}`)
     const response = await postForm(
-      endpoint("token"),
+      await endpoint("token"),
       { grant_type: "refresh_token", client_id: config.cliClientID, refresh_token: stored.refresh },
       shutdown,
     )
@@ -408,11 +436,15 @@ function createAuthentik(config, relogin, shutdown, reread) {
   }
 
   const revoked = async (proxyToken) => {
-    const response = await fetch(endpoint("userinfo"), {
-      headers: { authorization: `Bearer ${proxyToken}`, accept: "application/json" },
-      redirect: "manual",
-      signal: timeout(shutdown),
-    }).catch(() => undefined)
+    const response = await endpoint("userinfo")
+      .then((url) =>
+        fetch(url, {
+          headers: { authorization: `Bearer ${proxyToken}`, accept: "application/json" },
+          redirect: "manual",
+          signal: timeout(shutdown),
+        }),
+      )
+      .catch(() => undefined)
     await response?.body?.cancel().catch(() => {})
     return response?.status === 401 && (response.headers.get("www-authenticate") ?? "").includes("invalid_token")
   }
@@ -437,7 +469,7 @@ function createOpenWebUI(config, shutdown, rejection) {
   const sessions = new Map()
 
   const signIn = async (proxyToken) => {
-    const response = await fetch(`${config.openwebuiOrigin}/api/v1/auths/signin`, {
+    const response = await fetch(`${await config.origin()}/api/v1/auths/signin`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${proxyToken}`,
@@ -476,7 +508,7 @@ function createOpenWebUI(config, shutdown, rejection) {
 
   const models = async (proxyToken) => {
     const session = await token(proxyToken)
-    const response = await fetch(`${config.openwebuiOrigin}/api/models`, {
+    const response = await fetch(`${await config.origin()}/api/models`, {
       headers: { authorization: `Bearer ${proxyToken}`, "x-open-webui-token": session, accept: "application/json" },
       redirect: "manual",
       signal: timeout(shutdown),
