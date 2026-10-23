@@ -65,9 +65,14 @@ The plugin expects this on the authentik and Open WebUI side:
 
 ## Install
 
-1. In `~/.config/opencode/opencode.jsonc`, add the npm package `opencode-openwebui-authentik`
-   to `plugins`, mark each Open WebUI provider with `"openwebuiAuthentik": true` in its
-   `settings`, and remove `settings.apiKey` from it.
+1. Install the plugin from npm. This adds it to `plugins` in your global opencode config:
+
+   ```sh
+   opencode plugin add opencode-openwebui-authentik
+   ```
+
+2. In `~/.config/opencode/opencode.jsonc`, mark each Open WebUI provider with
+   `"openwebuiAuthentik": true` in its `settings`, and remove `settings.apiKey` from it.
 
    ```jsonc
    {
@@ -84,12 +89,28 @@ The plugin expects this on the authentik and Open WebUI side:
 
    The marker stays inside opencode: it isn't sent with model requests. Providers without it
    are left alone.
+3. Check that it loaded: `opencode plugin list` should show `openwebui-authentik`.
 
-   To run from a clone instead, put the clone's directory in `plugins`. It must be the
-   directory, not `index.js`; opencode ignores file paths here. Don't also copy it into
-   `~/.config/opencode/plugins/`: that folder is loaded automatically, so opencode would
-   find the plugin twice and report the second copy as a duplicate plugin ID.
-2. Check that it loaded: `opencode plugin list` should show `openwebui-authentik`.
+To upgrade later, run `opencode plugin update opencode-openwebui-authentik`.
+
+### Manual install
+
+1. Clone this repo somewhere stable.
+2. In `~/.config/opencode/opencode.jsonc`, add the clone's directory to `plugins` and mark
+   your providers as in step 2 above. The plugin path must be the directory, not `index.js`;
+   opencode ignores file paths here.
+
+   ```jsonc
+   {
+     "plugins": ["/home/<you>/code/opencode-openwebui-authentik"]
+   }
+   ```
+
+   Don't also copy the directory into `~/.config/opencode/plugins/`: that folder is loaded
+   automatically, so opencode would find the plugin twice and report the second copy as a
+   duplicate plugin ID.
+3. Check that it loaded: `opencode plugin list` should show `openwebui-authentik`.
+4. To upgrade, `git pull` in the clone.
 
 ## Options
 
