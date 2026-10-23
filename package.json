@@ -1,13 +1,20 @@
 {
   "name": "opencode-openwebui-authentik",
-  "private": true,
+  "version": "0.1.0",
   "description": "opencode plugin: use Open WebUI behind authentik forward auth with your authentik login",
+  "keywords": ["opencode", "opencode-plugin", "open-webui", "authentik"],
+  "license": "MIT",
+  "author": "FedotCompot",
   "type": "module",
   "main": "index.js",
+  "exports": "./index.js",
+  "files": ["index.js"],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/FedotCompot/opencode-openwebui-authentik.git"
   },
+  "homepage": "https://github.com/FedotCompot/opencode-openwebui-authentik#readme",
+  "bugs": "https://github.com/FedotCompot/opencode-openwebui-authentik/issues",
   "scripts": {
     "test": "bun test"
   }
