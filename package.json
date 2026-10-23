@@ -1,6 +1,6 @@
 {
   "name": "opencode-openwebui-authentik",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "opencode plugin: use Open WebUI behind authentik forward auth with your authentik login",
   "keywords": ["opencode", "opencode-plugin", "open-webui", "authentik"],
   "license": "MIT",
