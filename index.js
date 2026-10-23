@@ -1,5 +1,6 @@
-const REQUIRED = ["authentikURL", "openwebuiURL", "cliClientID"]
-const SETTINGS = [...REQUIRED, "proxyClientID"]
+const REQUIRED = ["authentikURL", "openwebuiURL"]
+const SETTINGS = [...REQUIRED, "cliClientID", "proxyClientID"]
+const DEFAULT_CLI_CLIENT_ID = "open-webui-cli"
 const DEFAULT_PROVIDERS = { openwebui: {} }
 const MODELS_REFRESH_MINUTES = 5
 
@@ -177,7 +178,7 @@ function configure(options) {
   const shared = strings(options)
   const providers = isObject(options?.providers) ? options.providers : DEFAULT_PROVIDERS
   return Object.entries(providers).map(([providerID, overrides]) => {
-    const merged = { proxyClientID: "", ...shared, ...strings(overrides) }
+    const merged = { cliClientID: DEFAULT_CLI_CLIENT_ID, proxyClientID: "", ...shared, ...strings(overrides) }
     const missing = REQUIRED.filter((key) => !merged[key])
     if (missing.length) throw new Error(`openwebui-authentik: provider ${providerID} needs ${missing.join(", ")}`)
     return {

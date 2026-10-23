@@ -242,7 +242,7 @@ describe("configuration", () => {
   test("refuses a provider without its authentik and Open WebUI settings", async () => {
     const fake = fakeCtx({ providers: { openwebui: {}, other: { authentikURL: mocks.authentik.url.origin } } })
     await expect(plugin.setup(fake.ctx)).rejects.toThrow(
-      /provider openwebui needs authentikURL, openwebuiURL, cliClientID/,
+      /provider openwebui needs authentikURL, openwebuiURL$/,
     )
   })
 

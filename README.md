@@ -25,8 +25,8 @@ you don't need an Open WebUI API key.
 
 The plugin expects this on the authentik and Open WebUI side:
 
-- **CLI provider**: a public OAuth2 provider for the plugin (its client ID is `cliClientID`)
-  with the `device_code` and `refresh_token` grants and the `openid email profile
+- **CLI provider**: a public OAuth2 provider for the plugin, client ID `open-webui-cli`
+  unless you set `cliClientID`, with the `device_code` and `refresh_token` grants and the `openid email profile
   offline_access` scopes. Use an authorization flow with explicit consent that is not
   remembered: remembered consent lets anyone who tricks a user into opening a device link
   log in silently.
@@ -74,8 +74,7 @@ The plugin expects this on the authentik and Open WebUI side:
          "package": "/home/<you>/code/opencode-openwebui-authentik",
          "options": {
            "authentikURL": "https://authentik.example.com",
-           "openwebuiURL": "https://openwebui.example.com",
-           "cliClientID": "open-webui-cli"
+           "openwebuiURL": "https://openwebui.example.com"
          }
        }
      ],
@@ -99,7 +98,6 @@ The plugin expects this on the authentik and Open WebUI side:
 ```jsonc
 {
   "authentikURL": "https://authentik.example.com",
-  "cliClientID": "open-webui-cli",
   "modelsRefreshMinutes": 5,
   "providers": {
     "openwebui": { "openwebuiURL": "https://openwebui.example.com" },
@@ -111,8 +109,8 @@ The plugin expects this on the authentik and Open WebUI side:
 - `providers`: the opencode providers the plugin manages, keyed by provider ID. Each one gets
   its own authentik login (`opencode auth login <id> --method authentik`) and model sync.
   Defaults to `{ "openwebui": {} }`.
-- `authentikURL`, `openwebuiURL`, `cliClientID` (required) and `proxyClientID` (optional,
-  discovered when unset): set them at the top level for all providers, or inside a provider
+- `authentikURL` and `openwebuiURL` (required), `cliClientID` (default `open-webui-cli`) and
+  `proxyClientID` (discovered when unset): set them at the top level for all providers, or inside a provider
   entry for that provider only.
 - `modelsRefreshMinutes`: how often to re-sync models, default `5`. `0` turns the sync off and
   leaves the configured models alone.
@@ -141,7 +139,7 @@ until it expires or an admin revokes it in authentik.
 
 ## Errors
 
-- `provider <id> needs authentikURL, ...`: the plugin options lack a required setting.
+- `provider <id> needs authentikURL, openwebuiURL`: the plugin options lack a required setting.
 - `No authentik login is active for openwebui`: run the login command.
 - `authentik rejected the Open WebUI credential`: an admin revoked your Open WebUI token, or it
   expired. Log in again.
