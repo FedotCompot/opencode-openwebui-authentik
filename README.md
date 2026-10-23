@@ -1,14 +1,13 @@
 # opencode plugin: Open WebUI via authentik
 
-Server plugin for opencode v2 (tested against v2.0.23). It lets opencode use
+Server plugin for opencode v2 (tested against v2.1.2). It lets opencode use
 `https://openwebui.example.com` with your authentik account, so you don't need an
 Open WebUI API key.
 
 - `opencode auth login` runs the authentik device-code login (client `open-webui-cli`).
 - The plugin exchanges that login for an authentik token of the Open WebUI proxy provider.
   It finds that provider's client ID in the redirect that `https://openwebui.example.com/`
-  sends to logged-out clients. To skip this, use the plugin entry form
-  `{ "package": "<dir>", "options": { "proxyClientID": "..." } }`.
+  sends to logged-out clients. To skip this, set `proxyClientID` (see [Options](#options)).
   The exchange runs the Open WebUI access policies, so you must be in the `Open WebUI`
   group. It then signs in to Open WebUI to get a session token for your email.
 - Each model request sends `Authorization: Bearer <authentik token>` and
@@ -37,11 +36,39 @@ Open WebUI API key.
    }
    ```
 
-   The provider ID must stay `openwebui`. The plugin attaches to the integration with
-   the same ID. Don't also copy the directory into `~/.config/opencode/plugins/`: that
-   folder is loaded automatically, so opencode would find the plugin twice and report
-   the second copy as a duplicate plugin ID.
+   By default the plugin manages the provider `openwebui`; for other provider IDs or Open
+   WebUI instances, see [Options](#options). Don't also copy the directory into
+   `~/.config/opencode/plugins/`: that folder is loaded automatically, so opencode would find
+   the plugin twice and report the second copy as a duplicate plugin ID.
 3. Check that it loaded: `opencode plugin list` should show `openwebui-authentik`.
+
+## Options
+
+Use the plugin entry form `{ "package": "<dir>", "options": { ... } }`:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "/home/<you>/code/opencode-openwebui-authentik",
+      "options": {
+        "providers": {
+          "openwebui": {},
+          "openwebui-test": { "openwebuiURL": "https://ai.test.example", "proxyClientID": "..." }
+        }
+      }
+    }
+  ]
+}
+```
+
+- `providers`: the opencode providers the plugin manages, keyed by provider ID. Each one gets
+  its own authentik login (`opencode auth login <id> --method authentik`).
+  Defaults to `{ "openwebui": {} }`.
+- `authentikURL`, `openwebuiURL`, `cliClientID`, `proxyClientID`: set them at the top level
+  for all providers, or inside a provider entry for that provider only. They default to
+  `https://authentik.example.com`, `https://openwebui.example.com`, `open-webui-cli`
+  and discovery.
 
 ## Log in
 

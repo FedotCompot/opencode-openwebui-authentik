@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, test } from "bun:test"
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test"
 import plugin from "../index.js"
 import { createMocks } from "./mock.js"
 
@@ -89,13 +89,16 @@ function fakeCtx(options) {
       },
     },
   }
-  const store = (value, label = "openwebui") => {
-    const entry = { id: `cred_${credentials.length + 1}`, integrationID: "openwebui", label, value }
+  const store = (value, integrationID = "openwebui") => {
+    const entry = { id: `cred_${credentials.length + 1}`, integrationID, label: integrationID, value }
     credentials.push(entry)
     return entry
   }
   const trigger = async (name, event) => {
-    for (const hook of hooks[name]) await hook.callback(event)
+    for (const hook of hooks[name]) {
+      if (hook.opts?.providerID && hook.opts.providerID !== event.model?.providerID) continue
+      await hook.callback(event)
+    }
     return event
   }
   return { ctx, integrations, credentials, store, hooks, statuses, trigger }
@@ -108,14 +111,18 @@ const options = () => ({
   proxyClientID: "proxy-client",
 })
 
+const running = []
+afterEach(() => running.splice(0).forEach((fake) => fake.cleanup()))
+
 async function setup(overrides = {}) {
   const fake = fakeCtx({ ...options(), ...overrides })
   fake.cleanup = await plugin.setup(fake.ctx)
+  running.push(fake)
   return fake
 }
 
-async function login(fake) {
-  const impl = fake.integrations.get("openwebui").impl.get("authentik")
+async function login(fake, providerID = "openwebui") {
+  const impl = fake.integrations.get(providerID).impl.get("authentik")
   const authorization = await impl.authorize({})
   return { authorization, credential: await authorization.callback }
 }
@@ -156,6 +163,19 @@ describe("registration", () => {
     for (const name of ["http.request", "http.response", "retry"])
       expect(fake.hooks[name].map((h) => h.opts)).toEqual([{ providerID: "openwebui" }])
     expect(typeof fake.cleanup).toBe("function")
+  })
+})
+
+describe("providers", () => {
+  test("manages every configured provider with its own settings", async () => {
+    const fake = await setup({ providers: { openwebui: {}, other: { cliClientID: "other-cli" } } })
+    for (const id of ["openwebui", "other"])
+      expect(fake.integrations.get(id).methods).toEqual([{ id: "authentik", type: "oauth", label: "authentik (device login)" }])
+    expect(fake.hooks["http.request"].map((h) => h.opts.providerID)).toEqual(["openwebui", "other"])
+    await expect(login(fake, "other")).rejects.toThrow(/device authorization failed.*invalid_client/)
+    await login(fake)
+    const other = { ...scope, model: { providerID: "other", id: "m" }, request: chatRequest(fake, "") }
+    await expect(fake.trigger("http.request", other)).rejects.toThrow(/run: opencode auth login other --method authentik/)
   })
 })
 

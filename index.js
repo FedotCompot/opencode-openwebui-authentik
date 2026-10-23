@@ -1,10 +1,10 @@
 const DEFAULTS = {
-  providerID: "openwebui",
   authentikURL: "https://authentik.example.com",
   openwebuiURL: "https://openwebui.example.com",
   cliClientID: "open-webui-cli",
   proxyClientID: "",
 }
+const DEFAULT_PROVIDERS = { openwebui: {} }
 
 const METHOD_ID = "authentik"
 const CLI_SCOPE = "openid email profile offline_access"
@@ -23,134 +23,152 @@ const MINT_FAILED = "authentik-mint-failed"
 export default {
   id: "openwebui-authentik",
   setup: async (ctx) => {
-    const config = settings(ctx.options)
     const shutdown = new AbortController()
-    const relogin = `run: opencode auth login ${config.providerID} --method ${METHOD_ID}`
-    const reread = async () => {
-      const connection = await ctx.integration.connection.active(config.providerID)
-      return connection && ctx.integration.connection.resolve(connection)
-    }
-    const authentik = createAuthentik(config, relogin, shutdown.signal, reread)
-    const openwebui = createOpenWebUI(config, shutdown.signal, authentik.rejection)
-    const pending = new Map()
-    const retried = new Set()
-    let flagged
-
-    await ctx.integration.transform((editor) => {
-      editor.method.remove(config.providerID, { type: "key" })
-      editor.method.update({
-        integrationID: config.providerID,
-        method: { id: METHOD_ID, type: "oauth", label: "authentik (device login)" },
-        authorize: () => authentik.authorize(),
-        refresh: (credential) => authentik.refresh(credential),
-        label: (credential) => account(credential.access),
-      })
-    })
-
-    const current = async () => {
-      const connection = await ctx.integration.connection.active(config.providerID)
-      if (connection?.type !== "credential" || connection.method !== "oauth")
-        throw new Error(`No authentik login is active for ${config.providerID}; ${relogin}`)
-      const credential = await ctx.integration.connection.resolve(connection)
-      if (credential?.type !== "oauth" || credential.methodID !== METHOD_ID)
-        throw new Error(`The active ${config.providerID} credential is not an authentik login; ${relogin}`)
-      if (!credential.access || credential.access === MINT_FAILED)
-        throw new Error(authentik.mintFailure(credential.refresh))
-      return { connection, credential }
-    }
-
-    const setStatus = (connection, status) =>
-      ctx.integration.connection.status({ integrationID: config.providerID, connection, status }).catch(() => {})
-
-    const needsAuth = async (connection, message) => {
-      flagged = connection
-      await setStatus(connection, { status: "needs_auth", message })
-    }
-
-    const healthy = async () => {
-      if (!flagged) return
-      const connection = flagged
-      flagged = undefined
-      await setStatus(connection, undefined)
-    }
-
-    await ctx.session.hook(
-      "http.request",
-      async (event) => {
-        const origin = new URL(event.request.url).origin
-        if (origin !== config.openwebuiOrigin)
-          throw new Error(`Refusing to send authentik credentials to ${origin}; expected ${config.openwebuiOrigin}`)
-        const { connection, credential } = await current()
-        const token = await openwebui.token(credential.access).catch(async (error) => {
-          if (error instanceof AuthentikRejected && error.revoked) await needsAuth(connection, error.message)
-          throw error
-        })
-        event.request.headers.set("authorization", `Bearer ${credential.access}`)
-        event.request.headers.set("x-open-webui-token", token)
-      },
-      { providerID: config.providerID },
-    )
-
-    await ctx.session.hook(
-      "http.response",
-      async (event) => {
-        const response = event.response
-        const session = event.sessionID
-        // title and generate requests never reach the retry hook
-        const tracked = event.kind === "primary" || event.kind === "compaction"
-        if (tracked) pending.delete(session)
-        if (rejectedByAuthentik(response)) {
-          await response.body?.cancel().catch(() => {})
-          const proxyToken = bearer(event.request)
-          await openwebui.forget(proxyToken)
-          const error = await authentik.rejection(response, proxyToken)
-          if (error.revoked) {
-            const connection = await ctx.integration.connection.active(config.providerID).catch(() => undefined)
-            if (connection) await needsAuth(connection, error.message)
-          } else if (tracked) pending.set(session, REJECTED_RETRY_MS)
-          event.response = Response.json(
-            { error: { type: "authentication_error", message: error.message } },
-            { status: 401 },
-          )
-          return
-        }
-        if (response.status === 401) {
-          await openwebui.forget(bearer(event.request), event.request.headers.get("x-open-webui-token"))
-          if (tracked) pending.set(session, 0)
-          return
-        }
-        if (tracked) retried.delete(session)
-        if (response.ok) await healthy()
-      },
-      { providerID: config.providerID },
-    )
-
-    await ctx.session.hook(
-      "retry",
-      (event) => {
-        const delay = pending.get(event.sessionID)
-        pending.delete(event.sessionID)
-        if (delay === undefined || event.error.status !== 401 || retried.has(event.sessionID)) return
-        retried.add(event.sessionID)
-        event.decision = { retry: true, delay }
-      },
-      { providerID: config.providerID },
-    )
-
+    await Promise.all(configure(ctx.options).map((config) => manage(ctx, config, shutdown.signal)))
     return () => shutdown.abort()
   },
 }
 
-function settings(options) {
-  const merged = { ...DEFAULTS }
-  for (const key of Object.keys(DEFAULTS)) {
-    if (typeof options?.[key] === "string" && options[key]) merged[key] = options[key]
+async function manage(ctx, config, shutdown) {
+  const relogin = `run: opencode auth login ${config.providerID} --method ${METHOD_ID}`
+  const reread = async () => {
+    const connection = await ctx.integration.connection.active(config.providerID)
+    return connection && ctx.integration.connection.resolve(connection)
   }
-  return {
-    ...merged,
-    authentikURL: merged.authentikURL.replace(/\/+$/, ""),
-    openwebuiOrigin: new URL(merged.openwebuiURL).origin,
+  const authentik = createAuthentik(config, relogin, shutdown, reread)
+  const openwebui = createOpenWebUI(config, shutdown, authentik.rejection)
+  const pending = new Map()
+  const retried = new Set()
+  let flagged
+
+  await ctx.integration.transform((editor) => {
+    editor.method.remove(config.providerID, { type: "key" })
+    editor.method.update({
+      integrationID: config.providerID,
+      method: { id: METHOD_ID, type: "oauth", label: "authentik (device login)" },
+      authorize: () => authentik.authorize(),
+      refresh: (credential) => authentik.refresh(credential),
+      label: (credential) => account(credential.access),
+    })
+  })
+
+  const current = async () => {
+    const connection = await ctx.integration.connection.active(config.providerID)
+    if (connection?.type !== "credential" || connection.method !== "oauth")
+      throw new Error(`No authentik login is active for ${config.providerID}; ${relogin}`)
+    const credential = await ctx.integration.connection.resolve(connection)
+    if (credential?.type !== "oauth" || credential.methodID !== METHOD_ID)
+      throw new Error(`The active ${config.providerID} credential is not an authentik login; ${relogin}`)
+    if (!credential.access || credential.access === MINT_FAILED)
+      throw new Error(authentik.mintFailure(credential.refresh))
+    return { connection, credential }
   }
+
+  const setStatus = (connection, status) =>
+    ctx.integration.connection.status({ integrationID: config.providerID, connection, status }).catch(() => {})
+
+  const needsAuth = async (connection, message) => {
+    flagged = connection
+    await setStatus(connection, { status: "needs_auth", message })
+  }
+
+  const flagRevoked = (connection) => async (error) => {
+    if (error instanceof AuthentikRejected && error.revoked) await needsAuth(connection, error.message)
+    throw error
+  }
+
+  const healthy = async () => {
+    if (!flagged) return
+    const connection = flagged
+    flagged = undefined
+    await setStatus(connection, undefined)
+  }
+
+  await ctx.session.hook(
+    "http.request",
+    async (event) => {
+      const origin = new URL(event.request.url).origin
+      if (origin !== config.openwebuiOrigin)
+        throw new Error(`Refusing to send authentik credentials to ${origin}; expected ${config.openwebuiOrigin}`)
+      const { connection, credential } = await current()
+      const token = await openwebui.token(credential.access).catch(flagRevoked(connection))
+      event.request.headers.set("authorization", `Bearer ${credential.access}`)
+      event.request.headers.set("x-open-webui-token", token)
+    },
+    { providerID: config.providerID },
+  )
+
+  await ctx.session.hook(
+    "http.response",
+    async (event) => {
+      const response = event.response
+      const session = event.sessionID
+      // title and generate requests never reach the retry hook
+      const tracked = event.kind === "primary" || event.kind === "compaction"
+      if (tracked) pending.delete(session)
+      if (rejectedByAuthentik(response)) {
+        await response.body?.cancel().catch(() => {})
+        const proxyToken = bearer(event.request)
+        await openwebui.forget(proxyToken)
+        const error = await authentik.rejection(response, proxyToken)
+        if (error.revoked) {
+          const connection = await ctx.integration.connection.active(config.providerID).catch(() => undefined)
+          if (connection) await needsAuth(connection, error.message)
+        } else if (tracked) pending.set(session, REJECTED_RETRY_MS)
+        event.response = Response.json(
+          { error: { type: "authentication_error", message: error.message } },
+          { status: 401 },
+        )
+        return
+      }
+      if (response.status === 401) {
+        await openwebui.forget(bearer(event.request), event.request.headers.get("x-open-webui-token"))
+        if (tracked) pending.set(session, 0)
+        return
+      }
+      if (tracked) retried.delete(session)
+      if (response.ok) await healthy()
+    },
+    { providerID: config.providerID },
+  )
+
+  await ctx.session.hook(
+    "retry",
+    (event) => {
+      const delay = pending.get(event.sessionID)
+      pending.delete(event.sessionID)
+      if (delay === undefined || event.error.status !== 401 || retried.has(event.sessionID)) return
+      retried.add(event.sessionID)
+      event.decision = { retry: true, delay }
+    },
+    { providerID: config.providerID },
+  )
+}
+
+function configure(options) {
+  const shared = strings(options)
+  const providers = isObject(options?.providers) ? options.providers : DEFAULT_PROVIDERS
+  return Object.entries(providers).map(([providerID, overrides]) => {
+    const merged = { ...DEFAULTS, ...shared, ...strings(overrides) }
+    return {
+      ...merged,
+      providerID,
+      authentikURL: merged.authentikURL.replace(/\/+$/, ""),
+      openwebuiOrigin: new URL(merged.openwebuiURL).origin,
+    }
+  })
+}
+
+function strings(options) {
+  return Object.fromEntries(
+    Object.keys(DEFAULTS)
+      .filter((key) => typeof options?.[key] === "string" && options[key])
+      .map((key) => [key, options[key]]),
+  )
+}
+
+function isObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function createAuthentik(config, relogin, shutdown, reread) {
