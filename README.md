@@ -1,15 +1,16 @@
-# opencode plugin: Open WebUI via authentik
+# opencode-openwebui-authentik
 
-Server plugin for opencode v2 (tested against v2.1.2). It lets opencode use
-`https://openwebui.example.com` with your authentik account, so you don't need an
-Open WebUI API key.
+Server plugin for [opencode](https://opencode.ai) v2 (tested against v2.1.2). It lets opencode
+use an [Open WebUI](https://openwebui.com) instance that sits behind
+[authentik](https://goauthentik.io) forward auth. You log in with your authentik account, so
+you don't need an Open WebUI API key.
 
-- `opencode auth login` runs the authentik device-code login (client `open-webui-cli`).
+- `opencode auth login` runs the authentik device-code login against a public OAuth2 client.
 - The plugin exchanges that login for an authentik token of the Open WebUI proxy provider.
-  It finds that provider's client ID in the redirect that `https://openwebui.example.com/`
-  sends to logged-out clients. To skip this, set `proxyClientID` (see [Options](#options)).
-  The exchange runs the Open WebUI access policies, so you must be in the `Open WebUI`
-  group. It then signs in to Open WebUI to get a session token for your email.
+  It finds that provider's client ID in the redirect that Open WebUI sends to logged-out
+  clients. To skip this, set `proxyClientID` (see [Options](#options)). The exchange runs
+  the Open WebUI application's access policies. The plugin then signs in to Open WebUI to
+  get a session token for your email.
 - Each model request sends `Authorization: Bearer <authentik token>` and
   `X-Open-WebUI-Token: <Open WebUI token>`.
 - The plugin keeps each managed provider's model list in sync with what Open WebUI serves
@@ -20,16 +21,64 @@ Open WebUI API key.
   whether the token is still valid. Only a dead token marks the login as needing a new
   sign-in; a passing glitch is retried once and clears itself.
 
+## Server setup
+
+The plugin expects this on the authentik and Open WebUI side:
+
+- **CLI provider**: a public OAuth2 provider for the plugin (its client ID is `cliClientID`)
+  with the `device_code` and `refresh_token` grants and the `openid email profile
+  offline_access` scopes. Use an authorization flow with explicit consent that is not
+  remembered: remembered consent lets anyone who tricks a user into opening a device link
+  log in silently.
+- **Open WebUI proxy provider**: the forward-auth proxy provider of the Open WebUI
+  application. List the CLI provider under its JWT federation providers, so that a CLI
+  access token can be swapped for a proxy token (`client_credentials` grant with a JWT
+  assertion and the `ak_proxy` scope). Bind the users or groups allowed to use Open WebUI to
+  this application.
+- **Reverse proxy in front of Open WebUI**: it checks every request against the authentik
+  outpost and passes the user's email on as Open WebUI's trusted email header
+  (`WEBUI_AUTH_TRUSTED_EMAIL_HEADER`). It also turns `X-Open-WebUI-Token` into the
+  `Authorization` header that Open WebUI sees. With nginx:
+
+  ```nginx
+  # only JWT-shaped Open WebUI tokens, never sk- keys
+  map $http_x_open_webui_token $owui_authorization {
+      "" $http_authorization;
+      "~^eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$" "Bearer $http_x_open_webui_token";
+      default "Bearer invalid";
+  }
+
+  location / {
+      auth_request /_authentik;
+      auth_request_set $ak_email $upstream_http_x_authentik_email;
+      proxy_set_header X-authentik-email $ak_email;
+      proxy_set_header Authorization $owui_authorization;
+      proxy_set_header X-Open-WebUI-Token "";
+      proxy_pass http://open-webui;
+  }
+  ```
+
+  Don't forward `X-Open-WebUI-Token` to the outpost in the `/_authentik` subrequest.
+
 ## Install
 
-1. Put this directory somewhere stable, for example by keeping this repo checked out.
-2. In `~/.config/opencode/opencode.jsonc`, add the directory to `plugins`. The path
-   must be the directory, not `index.js`; opencode ignores file paths here. Remove
-   `settings.apiKey` from the `openwebui` provider:
+1. Clone this repo somewhere stable.
+2. In `~/.config/opencode/opencode.jsonc`, add the plugin with its options and remove
+   `settings.apiKey` from the provider. The path must be the directory, not `index.js`;
+   opencode ignores file paths here.
 
    ```jsonc
    {
-     "plugins": ["/home/<you>/code/opencode-openwebui-authentik"],
+     "plugins": [
+       {
+         "package": "/home/<you>/code/opencode-openwebui-authentik",
+         "options": {
+           "authentikURL": "https://authentik.example.com",
+           "openwebuiURL": "https://openwebui.example.com",
+           "cliClientID": "open-webui-cli"
+         }
+       }
+     ],
      "providers": {
        "openwebui": {
          "package": "@opencode/ai/providers/openai-compatible",
@@ -40,40 +89,31 @@ Open WebUI API key.
    }
    ```
 
-   By default the plugin manages the provider `openwebui`; for other provider IDs or Open
-   WebUI instances, see [Options](#options). Don't also copy the directory into
-   `~/.config/opencode/plugins/`: that folder is loaded automatically, so opencode would find
-   the plugin twice and report the second copy as a duplicate plugin ID.
+   Don't also copy the directory into `~/.config/opencode/plugins/`: that folder is loaded
+   automatically, so opencode would find the plugin twice and report the second copy as a
+   duplicate plugin ID.
 3. Check that it loaded: `opencode plugin list` should show `openwebui-authentik`.
 
 ## Options
 
-Use the plugin entry form `{ "package": "<dir>", "options": { ... } }`:
-
 ```jsonc
 {
-  "plugins": [
-    {
-      "package": "/home/<you>/code/opencode-openwebui-authentik",
-      "options": {
-        "modelsRefreshMinutes": 5,
-        "providers": {
-          "openwebui": {},
-          "openwebui-test": { "openwebuiURL": "https://ai.test.example", "proxyClientID": "..." }
-        }
-      }
-    }
-  ]
+  "authentikURL": "https://authentik.example.com",
+  "cliClientID": "open-webui-cli",
+  "modelsRefreshMinutes": 5,
+  "providers": {
+    "openwebui": { "openwebuiURL": "https://openwebui.example.com" },
+    "openwebui-test": { "openwebuiURL": "https://openwebui.test.example.com", "proxyClientID": "..." }
+  }
 }
 ```
 
 - `providers`: the opencode providers the plugin manages, keyed by provider ID. Each one gets
   its own authentik login (`opencode auth login <id> --method authentik`) and model sync.
   Defaults to `{ "openwebui": {} }`.
-- `authentikURL`, `openwebuiURL`, `cliClientID`, `proxyClientID`: set them at the top level
-  for all providers, or inside a provider entry for that provider only. They default to
-  `https://authentik.example.com`, `https://openwebui.example.com`, `open-webui-cli`
-  and discovery.
+- `authentikURL`, `openwebuiURL`, `cliClientID` (required) and `proxyClientID` (optional,
+  discovered when unset): set them at the top level for all providers, or inside a provider
+  entry for that provider only.
 - `modelsRefreshMinutes`: how often to re-sync models, default `5`. `0` turns the sync off and
   leaves the configured models alone.
 
@@ -83,12 +123,12 @@ Use the plugin entry form `{ "package": "<dir>", "options": { ... } }`:
 opencode auth login openwebui --method authentik
 ```
 
-Open the URL it prints. authentik shows a consent screen every time; approve it only if
-you started this login yourself. The code is in the browser's address bar, not on the
-page. `opencode auth list` should then list your email under `openwebui`.
+Open the URL it prints. authentik shows a consent screen; approve it only if you started this
+login yourself. The code is in the browser's address bar, not on the page. `opencode auth
+list` should then list your email under `openwebui`.
 
-Never approve a device login from a link someone sent you. That gives them your Open
-WebUI access.
+Never approve a device login from a link someone sent you. That gives them your Open WebUI
+access.
 
 ## Log out
 
@@ -96,41 +136,41 @@ WebUI access.
 opencode auth logout openwebui
 ```
 
-This deletes the stored credential on this machine. The authentik refresh token stays
-valid until it expires or an admin revokes it in authentik.
+This deletes the stored credential on this machine. The authentik refresh token stays valid
+until it expires or an admin revokes it in authentik.
 
 ## Errors
 
+- `provider <id> needs authentikURL, ...`: the plugin options lack a required setting.
 - `No authentik login is active for openwebui`: run the login command.
-- `authentik rejected the Open WebUI credential`: an admin revoked your Open WebUI
-  token, or it expired. Log in again.
-- `authentik could not verify the Open WebUI credential`: authentik rejected the request
-  but still reports the token as valid, usually because authentik was briefly unreachable.
-  The plugin retries once; otherwise try again shortly.
-- `Could not find the Open WebUI authentik client`: `https://openwebui.example.com/`
-  did not redirect to authentik. Check the URL, or set `proxyClientID`.
-- `Could not get an Open WebUI token from authentik`: the token exchange failed. Usually
-  this means you aren't in the `Open WebUI` group, or your email is missing or
-  duplicated. The plugin keeps your login and retries after 30 seconds.
+- `authentik rejected the Open WebUI credential`: an admin revoked your Open WebUI token, or it
+  expired. Log in again.
+- `authentik could not verify the Open WebUI credential`: authentik rejected the request but
+  still reports the token as valid, usually because authentik was briefly unreachable. The
+  plugin retries once; otherwise try again shortly.
+- `Could not find the Open WebUI authentik client`: Open WebUI did not redirect to authentik.
+  Check `openwebuiURL`, or set `proxyClientID`.
+- `Could not get an Open WebUI token from authentik`: the token exchange failed. Usually this
+  means the access policies deny you, or your email is missing or duplicated. The plugin
+  keeps your login and retries after 30 seconds.
 
 ## Removing access
 
-authentik checks the `Open WebUI` group only when it issues an Open WebUI token. A user
-removed from the group keeps access until their current token expires (up to 12 hours),
-then gets the token exchange error above. To cut someone off immediately, deactivate them
-in authentik (Directory > Users > user > Deactivate), which deletes all their tokens. To
-keep the account active instead, remove them from the group and, under Directory > Users >
-user > Credentials / Tokens, delete their `Provider for Open WebUI` entries in OAuth Access
-Tokens and their `Provider for Open WebUI CLI` entries in OAuth Refresh Tokens. Revoking
-sessions is not enough. The outpost can take up to a minute to notice.
+authentik runs the access policies only when it issues an Open WebUI token. A user who loses
+access keeps it until their current proxy token expires, then gets the token exchange error
+above. To cut someone off immediately, deactivate them in authentik, which deletes all their
+tokens. To keep the account active instead, delete their OAuth access tokens for the Open
+WebUI proxy provider and their refresh tokens for the CLI provider (Directory > Users > user >
+Credentials / Tokens). Revoking sessions is not enough. The outpost can take up to a minute to
+notice.
 
 ## Tests
 
-`bun test` in this directory runs the plugin against mock authentik and Open WebUI servers.
+`bun test` runs the plugin against mock authentik and Open WebUI servers.
 
 ## Known limitation
 
 If authentik rejects the token (after an admin revokes it, or when authentik is briefly
-unreachable), Traefik redirects the request to authentik. opencode follows the redirect and still sends the
-`X-Open-WebUI-Token` header, so that request leaks the Open WebUI token to authentik.
-The plugin then drops that token and does not send it again.
+unreachable), the forward auth redirects the request to authentik. opencode follows the
+redirect and still sends the `X-Open-WebUI-Token` header, so that request leaks the Open WebUI
+token to authentik. The plugin then drops that token and does not send it again.
