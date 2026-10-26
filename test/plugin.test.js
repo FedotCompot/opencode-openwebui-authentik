@@ -853,6 +853,45 @@ describe("model sync", () => {
     expect(models(fake).m.variants).toEqual([variant("m", "thinking", "none")])
   })
 
+  test("syncs context and output limits and vision from the served models", async () => {
+    mocks.state.models = [
+      { id: "m", max_input_tokens: 500000, info: { meta: { capabilities: { vision: false } } } },
+      { id: "litellm", max_input_tokens: 500000, max_output_tokens: 500000 },
+      {
+        id: "capped",
+        max_input_tokens: 128000,
+        max_output_tokens: 8192,
+        info: { meta: { capabilities: { vision: false } } },
+      },
+      { id: "vllm", max_model_len: 65536, info: { meta: { capabilities: { vision: true } } } },
+      { id: "routed", context_length: 1000000, max_model_len: 2, info: { params: { max_tokens: 4096 } } },
+      { id: "ollama", owned_by: "ollama", info: { params: { num_ctx: 16384 } } },
+      { id: "foreign-ctx", context_length: 8192, info: { params: { num_ctx: 16384 } } },
+      { id: "preset", info: { base_model_id: "base", params: { max_tokens: 1024 } } },
+      { id: "base", max_input_tokens: 32768, max_output_tokens: 2048, info: { meta: { hidden: true } } },
+      { id: "plain" },
+    ]
+    const fake = await setup({ modelsRefreshMinutes: 5 })
+    const { credential } = await login(fake)
+    fake.store(credential)
+    fake.emit({ type: "credential.switched" })
+    await until(() => fake.reloads.count === 1)
+    const synced = models(fake)
+    expect(synced.m).toEqual({ id: "m", name: "configured m", limit: { context: 1000 } })
+    const limits = (id) => synced[id].limit
+    expect(limits("litellm")).toEqual({ context: 500000 })
+    expect(limits("capped")).toEqual({ context: 128000, output: 8192 })
+    expect(synced.capped.capabilities).toEqual({ input: ["text"] })
+    expect(limits("vllm")).toEqual({ context: 65536 })
+    expect(synced.vllm.capabilities).toEqual({ input: ["text", "image"] })
+    expect(limits("routed")).toEqual({ context: 1000000, output: 4096 })
+    expect(limits("ollama")).toEqual({ context: 16384 })
+    expect(limits("foreign-ctx")).toEqual({ context: 8192 })
+    expect(limits("preset")).toEqual({ context: 32768, output: 1024 })
+    expect(synced.base).toBeUndefined()
+    expect(synced.plain).toEqual({ id: "plain", name: "plain" })
+  })
+
   test("re-syncs periodically, reloads only on change, stops on cleanup", async () => {
     const fake = await setup({ modelsRefreshMinutes: 1 })
     const { credential } = await login(fake)

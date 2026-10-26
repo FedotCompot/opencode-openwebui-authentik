@@ -100,7 +100,7 @@ async function manage(ctx, settings, shutdown) {
       for (const [id, served] of models) {
         if (configured.has(id) && !served.variants.length) continue
         editor.update(config.providerID, id, (model) => {
-          if (!configured.has(id)) model.name = served.name
+          if (!configured.has(id)) applyServed(model, served)
           if (served.variants.length) model.variants = structuredClone(served.variants)
         })
       }
@@ -284,6 +284,29 @@ async function onEvents(ctx, handlers, signal) {
 
 function sameModels(a, b) {
   return JSON.stringify([...a]) === JSON.stringify([...b])
+}
+
+function applyServed(model, served) {
+  model.name = served.name
+  if (Object.keys(served.limit).length) model.limit = { ...model.limit, ...served.limit }
+  if (typeof served.vision === "boolean") {
+    const input = (model.capabilities?.input ?? ["text"]).filter((modality) => modality !== "image")
+    model.capabilities = { ...model.capabilities, input: served.vision ? [...input, "image"] : input }
+  }
+}
+
+function servedLimit(model) {
+  const tokens = (value) => (Number.isInteger(value) && value > 0 ? value : undefined)
+  const params = model?.info?.params
+  const context =
+    (model?.owned_by === "ollama" ? tokens(params?.num_ctx) : undefined) ??
+    tokens(model?.context_length) ??
+    tokens(model?.max_model_len) ??
+    tokens(model?.max_input_tokens)
+  const reported = tokens(model?.max_output_tokens)
+  // LiteLLM reports the whole window as output
+  const output = tokens(params?.max_tokens) ?? (reported < (context ?? Infinity) ? reported : undefined)
+  return Object.fromEntries(Object.entries({ context, output }).filter(([, value]) => value !== undefined))
 }
 
 function effortVariants(model) {
@@ -574,14 +597,18 @@ function createOpenWebUI(config, shutdown, rejection) {
     const body = await response.json().catch(() => ({}))
     if (!response.ok || !Array.isArray(body?.data))
       throw new Error(`Open WebUI model list failed (HTTP ${response.status})`)
+    const listed = body.data.filter((model) => typeof model?.id === "string" && model.id)
+    const byID = new Map(listed.map((model) => [model.id, model]))
     return new Map(
-      body.data
-        .filter((model) => typeof model?.id === "string" && model.id && !model.info?.meta?.hidden)
+      listed
+        .filter((model) => !model.info?.meta?.hidden)
         .map((model) => [
           model.id,
           {
             name: typeof model.name === "string" && model.name ? model.name : model.id,
             variants: effortVariants(model),
+            limit: { ...servedLimit(byID.get(model.info?.base_model_id)), ...servedLimit(model) },
+            vision: model.info?.meta?.capabilities?.vision,
           },
         ]),
     )
