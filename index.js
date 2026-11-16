@@ -311,7 +311,7 @@ function servedLimit(model) {
 
 function effortVariants(model) {
   const controls = model.info?.params?.model_controls
-  if (!isObject(controls)) return []
+  if (!isObject(controls)) return litellmEffortVariants(model)
   const keys = Object.keys(controls)
   const key = keys.includes(EFFORT_CONTROL) ? EFFORT_CONTROL : keys.length === 1 ? keys[0] : undefined
   const options = controls[key]?.options
@@ -320,6 +320,20 @@ function effortVariants(model) {
     id: option,
     body: { params: { model_controls: { [model.id]: { [key]: option } } } },
   }))
+}
+
+function litellmEffortVariants(model) {
+  const levels = model.supported_reasoning_efforts
+  if (!Array.isArray(levels)) return []
+  return levels
+    .filter((level) => typeof level === "string" && level)
+    .map((level) => ({ id: level, body: { reasoning_effort: level } }))
+}
+
+// LiteLLM's /model_group/info names a model model_group
+function servedID(model) {
+  const id = model?.id ?? model?.model_group
+  return typeof id === "string" && id ? id : undefined
 }
 
 function createAuthentik(config, relogin, shutdown, reread) {
@@ -597,7 +611,7 @@ function createOpenWebUI(config, shutdown, rejection) {
     const body = await response.json().catch(() => ({}))
     if (!response.ok || !Array.isArray(body?.data))
       throw new Error(`Open WebUI model list failed (HTTP ${response.status})`)
-    const listed = body.data.filter((model) => typeof model?.id === "string" && model.id)
+    const listed = body.data.filter(servedID).map((model) => ({ ...model, id: servedID(model) }))
     const byID = new Map(listed.map((model) => [model.id, model]))
     return new Map(
       listed
