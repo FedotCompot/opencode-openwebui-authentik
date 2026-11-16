@@ -853,6 +853,41 @@ describe("model sync", () => {
     expect(models(fake).m.variants).toEqual([variant("m", "thinking", "none")])
   })
 
+  test("turns LiteLLM's supported reasoning efforts into reasoning_effort variants", async () => {
+    const variant = (level) => ({ id: level, body: { reasoning_effort: level } })
+    mocks.state.models = [
+      {
+        model_group: "ds",
+        max_input_tokens: 1048576,
+        max_output_tokens: 1048576,
+        supported_reasoning_efforts: ["none", "high"],
+      },
+      { model_group: "unknown", supported_reasoning_efforts: null },
+      { model_group: "flat", supported_reasoning_efforts: [] },
+      {
+        id: "both",
+        supported_reasoning_efforts: ["low"],
+        info: { params: { model_controls: { thinking: { options: { max: { label: "Max" } } } } } },
+      },
+      { supported_reasoning_efforts: ["low"] },
+    ]
+    const fake = await setup({ modelsRefreshMinutes: 5 })
+    const { credential } = await login(fake)
+    fake.store(credential)
+    fake.emit({ type: "credential.switched" })
+    await until(() => fake.reloads.count === 1)
+    expect(models(fake)).toEqual({
+      ds: { id: "ds", name: "ds", limit: { context: 1048576 }, variants: [variant("none"), variant("high")] },
+      unknown: { id: "unknown", name: "unknown" },
+      flat: { id: "flat", name: "flat" },
+      both: {
+        id: "both",
+        name: "both",
+        variants: [{ id: "max", body: { params: { model_controls: { both: { thinking: "max" } } } } }],
+      },
+    })
+  })
+
   test("syncs context and output limits and vision from the served models", async () => {
     mocks.state.models = [
       { id: "m", max_input_tokens: 500000, info: { meta: { capabilities: { vision: false } } } },
