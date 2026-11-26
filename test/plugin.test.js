@@ -243,6 +243,7 @@ beforeEach(() => {
     deviceExpiresIn: 600,
     mintFail: false,
     refreshDelayMs: 0,
+    modelsHold: undefined,
     offline: true,
     outpostDown: false,
     userinfoDown: false,
@@ -925,6 +926,31 @@ describe("model sync", () => {
     expect(limits("preset")).toEqual({ context: 32768, output: 1024 })
     expect(synced.base).toBeUndefined()
     expect(synced.plain).toEqual({ id: "plain", name: "plain" })
+  })
+
+  const restart = async (overrides) => {
+    const { credential } = await login(await setup(overrides))
+    const fake = fakeCtx({ ...options(), ...overrides })
+    fake.store(credential)
+    fake.cleanup = await plugin.setup(fake.ctx)
+    running.push(fake)
+    return fake
+  }
+
+  test("startup waits for the first sync of a stored login", async () => {
+    const fake = await restart({ modelsRefreshMinutes: 5 })
+    expect(fake.reloads.count).toBe(1)
+    expect(Object.keys(models(fake))).toEqual(["m"])
+  })
+
+  test("startup stops waiting for a slow first sync after 10s", async () => {
+    let release
+    mocks.state.modelsHold = new Promise((resolve) => (release = resolve))
+    const fake = await restart({ modelsRefreshMinutes: 5 })
+    expect(delays).toContain(10_000)
+    expect(fake.reloads.count).toBe(0)
+    release()
+    await until(() => fake.reloads.count === 1)
   })
 
   test("re-syncs periodically, reloads only on change, stops on cleanup", async () => {
