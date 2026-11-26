@@ -13,6 +13,7 @@ export function createMocks() {
     owuiTokens: new Set(),
     mintFail: false,
     refreshDelayMs: 0,
+    modelsHold: undefined,
     offline: true,
     outpostDown: false,
     userinfoDown: false,
@@ -145,6 +146,7 @@ export function createMocks() {
       }
       if (url.pathname === "/api/models") {
         state.counts.models++
+        await state.modelsHold
         if (!state.owuiTokens.has(req.headers.get("x-open-webui-token"))) return json({ detail: "Invalid token" }, 401)
         return json({ data: state.models })
       }

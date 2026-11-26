@@ -2,6 +2,7 @@ const MARKER = "openwebuiAuthentik"
 const SETTINGS = ["authentikURL", "cliClientID", "proxyClientID"]
 const DEFAULT_CLI_CLIENT_ID = "open-webui-cli"
 const MODELS_REFRESH_MINUTES = 5
+const STARTUP_SYNC_MS = 10_000
 const EFFORT_CONTROL = "thinking"
 
 const METHOD_ID = "authentik"
@@ -39,6 +40,7 @@ export default {
 // unlisted providers stay managed; the list is partial at startup
 async function adopt(ctx, managed, shutdown, sync) {
   const { data = [] } = await ctx.provider.list()
+  const synced = []
   for (const provider of data) {
     const marked = Boolean(provider.settings?.[MARKER])
     const config = marked ? configure(ctx.options, provider) : undefined
@@ -51,8 +53,9 @@ async function adopt(ctx, managed, shutdown, sync) {
     if (!config) continue
     const adopted = await manage(ctx, config, shutdown)
     managed.set(provider.id, adopted)
-    if (sync) adopted.sync()
+    if (sync) synced.push(adopted.sync())
   }
+  if (synced.length) await within(Promise.all(synced), STARTUP_SYNC_MS, shutdown)
 }
 
 async function manage(ctx, settings, shutdown) {
@@ -272,6 +275,13 @@ async function every(ms, fn, signal) {
     await sleep(ms, signal)
     fn()
   }
+}
+
+async function within(promise, ms, signal) {
+  const settled = new AbortController()
+  const timer = sleep(ms, AbortSignal.any([signal, settled.signal])).catch(() => {})
+  await Promise.race([promise, timer])
+  settled.abort()
 }
 
 async function onEvents(ctx, handlers, signal) {
